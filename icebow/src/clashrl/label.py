@@ -5,7 +5,7 @@ an arena placement (tap-tap or press-drag-release) -- and grabs the frame at the
 moment of selection as the observation. This v1 focuses on the (observation,
 action) core; match segmentation and win/loss labeling come next.
 
-Action per play: (slot 0-3, placement grid cell) plus the raw normalized (nx, ny).
+Action per play: (card identity, ANCHOR index, slot) plus the raw normalized (nx, ny).
 Observation: the game frame at selection time, downscaled to observation.arena_size.
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .actions import ActionSpace
+from .actions import AnchorSpace
 from . import card_threat
 from . import interactions
 from .cards import CardDB
@@ -148,8 +148,7 @@ def label_session(cfg, session: Path, debug: bool = False, det=None, db=None, wi
     a_top = float(cfg.get("label", "arena_top", default=0.10))
     a_bot = float(cfg.get("label", "arena_bottom", default=0.86))
     ow, oh = cfg.get("observation", "arena_size", default=[64, 96])
-    gw, gh = cfg.get("action", "grid", default=[18, 32])
-    aspace = ActionSpace(cfg)                          # box-anchored tile grid (same mapping the policy uses)
+    aspace = AnchorSpace(cfg)                          # per-card named anchors (the policy's action space)
 
     plays = _extract_plays(events, region, slots, click_r, pair_timeout, a_top, a_bot)
 
@@ -193,8 +192,12 @@ def label_session(cfg, session: Path, debug: bool = False, det=None, db=None, wi
             skipped += 1
             continue
         obs.append(cv2.resize(frame, (int(ow), int(oh)), interpolation=cv2.INTER_AREA))
-        gx, gy = aspace.coords_to_grid(p["nx"], p["ny"])
-        acts.append([card, gx, gy, p["slot"]])
+        # QUANTIZE the human's raw click onto the card's own anchor set -- behaviour cloning can only
+        # imitate actions the policy is able to take, and with named anchors that is a short list per
+        # card rather than a grid cell. A play far from every anchor is still snapped to the nearest
+        # one; `verify --anchors` is how you check the anchors actually cover how you play.
+        anchor = aspace.nearest(card, p["nx"], p["ny"])
+        acts.append([card, anchor, p["slot"]])
         hands.append(vision.hand_multihot(hand_ids))
         nexts.append(vision.next_onehot(vision.recognize_next(frame)))
         elixirs.append([vision.read_elixir(frame) / 10.0])
@@ -213,7 +216,7 @@ def label_session(cfg, session: Path, debug: bool = False, det=None, db=None, wi
             cv2.circle(f, (int(sx * w), int(sy * h)), 42, (255, 0, 0), 3)          # selected card
             cv2.drawMarker(f, (int(p["nx"] * w), int(p["ny"] * h)),
                            (0, 0, 255), cv2.MARKER_TILTED_CROSS, 32, 3)            # placement
-            cv2.putText(f, f"play {k}: {name} -> cell ({gx},{gy})", (8, 30),
+            cv2.putText(f, f"play {k}: {name} -> anchor {aspace.name(card, anchor)}", (8, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.imwrite(str(dbg_dir / f"play_{k:03d}.png"), f)
     cap.release()
@@ -227,7 +230,7 @@ def label_session(cfg, session: Path, debug: bool = False, det=None, db=None, wi
             nexts=np.asarray(nexts, dtype=np.float32),
             elixirs=np.asarray(elixirs, dtype=np.float32),
             threats=np.asarray(threats, dtype=np.float32),
-            grid=np.asarray([int(gw), int(gh)], dtype=np.int64),
+            action_space=np.asarray([json.dumps(aspace.signature())]),
             deck=np.asarray(vision.deck_keys),
         )
     extra = f"  ({skipped} plays skipped: card not recognized)" if skipped else ""

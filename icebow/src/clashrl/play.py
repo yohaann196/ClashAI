@@ -15,10 +15,10 @@ from pathlib import Path
 
 import numpy as np
 
-from .actions import ActionSpace
+from .actions import AnchorSpace, signature_diff, signatures_match
 from .capture import WindowCapture
 from .controller import Controller
-from .reward import TowerTracker, weaker_princess_cell, xbow_lock_cell
+from .reward import TowerTracker, weaker_princess_anchor
 from .states import GameState
 from .threats import ThreatTracker, THREAT_DIM
 from . import interactions
@@ -105,9 +105,28 @@ def play(cfg) -> None:
         return
 
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    gw, gh = int(ckpt["grid"][0]), int(ckpt["grid"][1])
-    n_cards, n_cells = int(ckpt["n_cards"]), int(ckpt["n_cells"])
+    n_cards = int(ckpt["n_cards"])
+    n_anchors = int(ckpt.get("n_anchors", 0))
     threat_dim = int(ckpt.get("threat_dim", 14))
+    # HARD GUARD: the ACTION SPACE must match. The placement head is indexed by each card's ANCHOR
+    # LIST, so under a different anchor set index 2 silently means a different tile -- the net loads
+    # fine and then places everything wrong. Same fail-fast pattern as the 377b5b7 deck guard.
+    from .actions import AnchorSpace as _AS
+    _aspace_chk = _AS(cfg)
+    _cur_sig = _aspace_chk.signature()
+    if not signatures_match(ckpt.get("action_space"), _cur_sig):
+        print(f"[play] checkpoint/ACTION-SPACE MISMATCH -- {ckpt_path.name} cannot be used:")
+        for line in signature_diff(ckpt.get("action_space"), _cur_sig):
+            print(f"[play]   {line}")
+        print(f"[play] current: {_cur_sig['n_cards']} cards x up to {_cur_sig['n_anchors']} anchors "
+              f"(hash {_cur_sig['hash']})")
+        print("[play] a policy trained on different anchors would place cards on the wrong tiles.")
+        print("[play] Restore the old anchors in config/cards.yaml, or train a fresh policy:")
+        print("[play]   run.py train-sim --matches 200000 --envs 32")
+        print("[play]   run.py train-rl --init data/policy_sim_best.pt")
+        print("[play] (confirm the anchors land on the intended tiles first: run.py verify --anchors)")
+        return
+
     # HARD GUARD: the OBSERVATION LAYOUT must match the checkpoint. A net trained on the semantic raster
     # cannot read RGB pixels (or vice versa) -- the conv trunk's first layer is literally a different
     # shape, and a hybrid net silently fed 3 channels would be reading grass where it expects troop mass.
@@ -122,7 +141,7 @@ def play(cfg) -> None:
         print("[play] (run.py train-sim --matches ... ; run.py train-rl --init data/policy_sim_best.pt).")
         return
     device = _pick_device(cfg)
-    net = PolicyNet(cfg_ch, n_cards, n_cells, threat_dim=threat_dim).to(device)
+    net = PolicyNet(cfg_ch, n_cards, n_anchors, threat_dim=threat_dim).to(device)
     net.load_state_dict(ckpt["model"])
     net.eval()
     # The RL checkpoint also carries the learned WAIT/PLAY gate head (train-rl's no-op). Load it so
@@ -141,28 +160,17 @@ def play(cfg) -> None:
         print("[play] no capture region; set window.region in config.yaml.")
         return
     vision = Vision(cfg)
-    actions = ActionSpace(cfg)
+    actions = AnchorSpace(cfg)
     controller = Controller(capture, cfg)
-    rocket_ids = {i for i, key in enumerate(vision.deck_keys)
-                  if (key[:-4] if key.endswith("_evo") else key) == "rocket"}
     hp_tracker = TowerHpTracker(cfg)          # enemy princess HP, for the rocket redirect
     tower_tracker = TowerTracker(cfg)         # tower alive/destroyed flags
     threat_tracker = ThreatTracker(cfg)       # live enemy-threat vector -> policy input
     from .clock import ElixirClock
     clock = ElixirClock(cfg, vision)          # 2x/3x elixir multiplier (feeds the phase machine)
-    aim_radius = float(cfg.get("env", "spell_tower_aim_radius", default=0.12))
-    anywhere_ids = {i for i, key in enumerate(vision.deck_keys)
-                    if (key[:-4] if key.endswith("_evo") else key) in ("rocket", "miner")}
-    xbow_ids = {i for i, key in enumerate(vision.deck_keys)
-                if (key[:-4] if key.endswith("_evo") else key) == "x_bow"}
-    xbow_range = float(cfg.get("env", "xbow_range", default=0.36))
-    xbow_defense_front = float(cfg.get("env", "xbow_defense_front", default=0.52))
-    # Cell-head DEPLOYABLE mask: anywhere cards (rocket / miner) -> all cells; every other card only
-    # YOUR half. Applied before the cell argmax so play never taps an enemy-half cell that can't
-    # deploy (the 'impossible coordinate' that made the bot look inactive).
-    yourhalf_mask = torch.tensor(actions.deployable_mask(False), dtype=torch.bool, device=device)
-    allcells_mask = torch.ones(n_cells, dtype=torch.bool, device=device)
-    yourhalf_cells = [c for c in range(n_cells) if bool(yourhalf_mask[c])]
+    # PER-CARD ANCHOR MASK: the placement head is as wide as the widest card's anchor list, so it is
+    # masked to the anchors the chosen card actually has (mirrors train_sim / train_rl).
+    anchor_mask = torch.tensor(actions.mask_table(), dtype=torch.bool, device=device)  # [n_cards, n_anchors]
+    anchor_counts = [actions.count(c) for c in range(n_cards)]
     # Connect each hand-card identity to its ELIXIR COST from the card DB, so play never taps a card
     # it can't afford (and can track its own spend). Indexed by deck/card id, same as the policy heads.
     from .cards import CardDB
@@ -339,13 +347,11 @@ def play(cfg) -> None:
         if random.random() < eps:
             choices = [i for i in range(n_cards) if not bool(torch.isinf(card_logits[0, i]))]
             card_id = random.choice(choices)
-            cells = list(range(n_cells)) if card_id in anywhere_ids else (yourhalf_cells or list(range(n_cells)))
-            cell = random.choice(cells)
+            cell = random.randrange(max(1, anchor_counts[card_id]))
         else:
             card_id = int(card_logits.argmax(1).item())
-            cmask = allcells_mask if card_id in anywhere_ids else yourhalf_mask   # DEPLOYABLE cells for this card
-            cell_logits_m = cell_logits.masked_fill(~cmask.unsqueeze(0), float("-inf"))
-            # GATE (synced with train-rl): value of PLAYING = Q_play + best card + best DEPLOYABLE cell;
+            cell_logits_m = cell_logits.masked_fill(~anchor_mask[card_id].unsqueeze(0), float("-inf"))
+            # GATE (synced with train-rl): value of PLAYING = Q_play + best card + best ANCHOR;
             # value of WAITING = Q_wait. If the policy prefers to wait, do nothing this tick (save elixir /
             # cycle) instead of firing every act_period like the old trol bot.
             if gate_logits is not None:
@@ -353,31 +359,21 @@ def play(cfg) -> None:
                 if gate_logits[0, 0] >= play_val:
                     return
             cell = int(cell_logits_m.argmax(1).item())
-        if card_id in anywhere_ids:           # a rocket / offensive miner at a princess -> aim the weaker one
-            gx, gy = cell % gw, cell // gw
-            cx, cy = actions.cell_center(gx, gy)
-            tgt = weaker_princess_cell(cx, cy, aim_radius, tower_tracker.enemy_a,
-                                       hp_tracker.enemy_hp, tower_tracker.enemy_alive, actions)
-            if tgt is not None:
-                cell = tgt
+        # a Rocket aimed at a princess -> retarget the WEAKER one so chip finishes a tower
+        cell = weaker_princess_anchor(actions, card_id, cell,
+                                      hp_tracker.enemy_hp, tower_tracker.enemy_alive)
         # Defensive units (Tesla / Ice Wizard / Ronin) are NO LONGER forced to the centre: the
         # model chooses where to place them (centre is only a rewarded default in training), so it
         # can block a lane or drop a Ronin up front to catch a ranged unit when that's better.
         slot = next((s for s, c in enumerate(hand_ids) if c == card_id), -1)
         if slot < 0:
             return
-        cell = actions.deploy_clamp(card_id in anywhere_ids, cell)   # only rocket/miner go anywhere
-        if card_id in xbow_ids:               # snap a forward X-Bow onto the nearer lane so it LOCKS the tower
-            gx, gy = cell % gw, cell // gw
-            cx, cy = actions.cell_center(gx, gy)
-            snapped = xbow_lock_cell(cx, cy, tower_tracker.enemy_a, xbow_range, xbow_defense_front, actions)
-            if snapped is not None:
-                cell = snapped
-        gx, gy = cell % gw, cell // gw
-        controller.play_card(*actions.decode(slot, gx, gy))
+        # No clamping and no X-Bow lane-snapping any more: every anchor IS an exact, legal tile, which
+        # is the whole reason the grid was replaced.
+        controller.play_card(*actions.decode(slot, card_id, cell))
         _cycle_tracker.record_play(card_id)        # a card left the hand -> it rotates to the queue back
         if card_id not in _spell_ids:              # a TROOP you played -> tag its spawn as YOURS (team fix)
-            cx, cy = actions.cell_center(gx, gy)
+            cx, cy = actions.point(card_id, cell)
             _team_tracker.record_play(cx, cy, time.time())
 
     running = {"v": True}

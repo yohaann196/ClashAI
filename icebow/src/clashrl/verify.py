@@ -30,7 +30,7 @@ def _load_events(session: Path):
 
 
 def verify(cfg, session_arg=None, towers=False, hand=False, spells=False, threats=False,
-           clock=False, all_sessions=False) -> None:
+           clock=False, anchors=False, all_sessions=False) -> None:
     root = cfg.path(cfg.get("record", "out_dir", default="data/sessions"))
     if all_sessions:                          # run the requested overlay over EVERY recorded session
         sessions = sorted(p for p in root.glob("*") if (p / "meta.json").exists())
@@ -39,7 +39,7 @@ def verify(cfg, session_arg=None, towers=False, hand=False, spells=False, threat
             return
         for s in sessions:
             print(f"\n[verify] ===== session {s.name} =====")
-            verify(cfg, str(s), towers, hand, spells, threats, clock, all_sessions=False)
+            verify(cfg, str(s), towers, hand, spells, threats, clock, anchors, all_sessions=False)
         return
     session = Path(session_arg) if session_arg else _latest_session(root)
     if session is None or not Path(session).exists():
@@ -61,6 +61,9 @@ def verify(cfg, session_arg=None, towers=False, hand=False, spells=False, threat
         print("[verify] no video found in session")
         return
 
+    if anchors:
+        _verify_anchors(cfg, session, meta, video)
+        return
     if towers:
         _verify_towers(cfg, session, meta, video)
         return
@@ -461,3 +464,136 @@ def _verify_towers(cfg, session: Path, meta: dict, video: Path) -> None:
           "env.my_towers / env.tower_alive_frac if the boxes miss towers or flags look wrong.")
     print("[verify] yellow = HP-number crops (value + CNN confidence). Tune "
           "env.enemy_tower_hp_boxes / env.my_tower_hp_boxes if a number is misboxed.")
+
+
+# --- anchors ---------------------------------------------------------------------------------------
+_ANCHOR_COLOURS = [(60, 220, 60), (60, 200, 255), (255, 140, 40), (255, 80, 220),
+                   (0, 215, 255), (200, 200, 60), (80, 80, 255), (255, 255, 255)]
+
+
+def _verify_anchors(cfg, session: Path, meta: dict, video: Path) -> None:
+    """Overlay EVERY placement anchor on real in-match frames, so you can confirm each lands on the
+    tile it is named for.
+
+    This is the calibration loop for the action space. The anchors in `config/cards.yaml` are tile
+    OFFSETS from landmarks (tower centres, bridges, the river) -- exact by construction only if the
+    tile size derived from `action.arena_box` matches the real board. Tile-exactness is the entire
+    reason the 18x24 grid was replaced, so an anchor that lands one tile off is worse than a grid cell:
+    the policy will trust it.
+
+    Writes one image PER CARD to `annotated_anchors/`, plus a combined sheet. Each anchor is drawn as a
+    crosshair with its name and a one-tile box, so 'is this the right tile?' is answerable by eye.
+
+    It also cross-checks the anchors against the REWARD geometry the trainers use, and prints any
+    conflict -- e.g. an X-Bow anchor that the reward would score as a misplace, which would train the
+    policy against the very placement the anchor exists to make.
+    """
+    from .actions import AnchorSpace
+    from .cards import CardDB
+    from .vision import Vision
+
+    db = CardDB(cfg)
+    aspace = AnchorSpace(cfg, db)
+    vision = Vision(cfg)
+    out_dir = session / "annotated_anchors"
+    out_dir.mkdir(exist_ok=True)
+
+    cap = cv2.VideoCapture(str(video))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    base = None
+    for k in range(40):                       # find one clean in-match frame to draw on
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int((k + 0.5) / 40 * total))
+        ok, frame = cap.read()
+        if ok and frame is not None and vision.detect_state(frame).name == "IN_MATCH":
+            base = frame
+            break
+    cap.release()
+    if base is None:
+        print("[verify] no IN_MATCH frame found in this session -- cannot overlay anchors")
+        return
+
+    h, w = base.shape[:2]
+    tw_px, th_px = aspace.tile_w * w, aspace.tile_h * h
+    print(f"[verify] anchors: {aspace.n_cards} cards, up to {aspace.n_anchors} each "
+          f"({sum(aspace.count(c) for c in range(aspace.n_cards))} placements); "
+          f"one tile = {tw_px:.1f}x{th_px:.1f} px")
+
+    def _draw(img, card_id, colour_by_index=True):
+        for i, a in enumerate(aspace.anchors_for(card_id)):
+            px, py = int(a.x * w), int(a.y * h)
+            col = _ANCHOR_COLOURS[i % len(_ANCHOR_COLOURS)] if colour_by_index else (60, 220, 60)
+            # one-tile box: if the anchor is right, the intended tile sits inside this box
+            cv2.rectangle(img, (int(px - tw_px / 2), int(py - th_px / 2)),
+                          (int(px + tw_px / 2), int(py + th_px / 2)), col, 1)
+            cv2.drawMarker(img, (px, py), col, cv2.MARKER_CROSS, 18, 2)
+            cv2.putText(img, a.name, (px + 8, py - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1,
+                        cv2.LINE_AA)
+
+    # landmarks the offsets hang off -- drawn once so you can see WHAT an anchor is relative to
+    combo = base.copy()
+    for name, (lx, ly) in sorted(aspace.landmarks.items()):
+        cv2.drawMarker(combo, (int(lx * w), int(ly * h)), (0, 0, 255), cv2.MARKER_DIAMOND, 14, 2)
+        cv2.putText(combo, name, (int(lx * w) + 8, int(ly * h) + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 255), 1, cv2.LINE_AA)
+
+    for card_id, key in enumerate(aspace.deck_keys):
+        img = base.copy()
+        for name, (lx, ly) in sorted(aspace.landmarks.items()):
+            cv2.drawMarker(img, (int(lx * w), int(ly * h)), (0, 0, 255), cv2.MARKER_DIAMOND, 12, 1)
+        _draw(img, card_id)
+        cv2.putText(img, f"{key}: {aspace.count(card_id)} anchors", (8, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.imwrite(str(out_dir / f"anchors_{card_id:02d}_{key}.png"), img)
+        _draw(combo, card_id, colour_by_index=False)
+        for a in aspace.anchors_for(card_id):
+            print(f"[verify]   {key:12} {a.name:20} {a.label:24} -> ({a.x:.4f}, {a.y:.4f})")
+    cv2.putText(combo, "ALL anchors (red diamonds = landmarks)", (8, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.imwrite(str(out_dir / "anchors_ALL.png"), combo)
+
+    _check_anchor_rewards(cfg, aspace)
+    print(f"[verify] wrote {aspace.n_cards + 1} overlay(s) to {out_dir}")
+    print("[verify] check each crosshair sits on the tile its name claims. If they are consistently "
+          "off, adjust action.arena_box (it sets the tile size); if one anchor is wrong, edit its "
+          "offset in config/cards.yaml under `anchors.cards`.")
+
+
+def _check_anchor_rewards(cfg, aspace) -> None:
+    """Cross-check anchors against the REWARD geometry, and report conflicts.
+
+    An anchor and the reward that scores it are configured separately, so they can disagree: an X-Bow
+    anchor placed where `_wincon_exec` scores a MISPLACE would actively train the policy away from the
+    placement the anchor exists to express. Better to print that here than to discover it as a training
+    curve that will not rise.
+    """
+    import math
+
+    from .reward import _anchors as tower_anchors
+
+    _, enemy_a, _ = tower_anchors(cfg)
+    xbow_range = float(cfg.get("env", "xbow_range", default=0.36))
+    front = float(cfg.get("env", "xbow_defense_front", default=0.52))
+    back = float(cfg.get("env", "xbow_defense_back", default=0.62))
+    problems = []
+    for card_id, key in enumerate(aspace.deck_keys):
+        if (key[:-4] if key.endswith("_evo") else key) != "x_bow":
+            continue
+        for a in aspace.anchors_for(card_id):
+            d = min(math.hypot(a.x - ax, a.y - ay) for ax, ay in enemy_a[:2])
+            central = abs(a.x - 0.48) <= 0.18
+            in_band = central and front <= a.y <= back
+            if a.name.startswith(("4tile", "5tile")) and d > xbow_range:
+                problems.append(
+                    f"x_bow.{a.name}: {d:.3f} from the nearest enemy princess but env.xbow_range is "
+                    f"{xbow_range:.3f} -> the OFFENSIVE reward scores this as a MISPLACE. Either move "
+                    f"the anchor forward or raise env.xbow_range to ~{d + 0.01:.2f}.")
+            if a.name == "defensive_centre" and not in_band:
+                problems.append(
+                    f"x_bow.{a.name}: y={a.y:.3f} is outside the defensive band "
+                    f"[{front:.2f}, {back:.2f}] -> the DEFENSIVE reward scores this as a misplace.")
+    if problems:
+        print("[verify] ANCHOR/REWARD CONFLICTS -- these would train the policy against its own anchors:")
+        for p in problems:
+            print(f"[verify]   ! {p}")
+    else:
+        print("[verify] anchor/reward cross-check: no conflicts")

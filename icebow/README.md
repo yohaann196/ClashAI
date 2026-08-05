@@ -40,7 +40,7 @@ optional (Stage 3): a YOLO object detector adds opponent awareness    [in progre
 The agent sees a **semantic board raster + the hand** (which cards are in hand)
 and picks a **discrete action**: which **card identity** to play — not the tray
 slot (cards cycle), and an **evolved card counts as its own identity** since it
-plays differently — placed on a grid cell, or no-op. Rewards: `+take_enemy_tower`,
+plays differently — placed on one of that card's **named anchors**, or no-op. Rewards: `+take_enemy_tower`,
 `+` for keeping your towers alive (defense), `+win`; `−` for the opposite (see
 `config/config.yaml`).
 
@@ -72,6 +72,37 @@ detections. Changing the mode changes the model's input size, so it needs a fres
 `train-rl`/`play` refuse a mismatch. `domain_rand` is off by default now (it only
 restyles the RGB planes, which `semantic` doesn't have) but still works for
 `rgb`/`hybrid`.
+
+### Where cards can be placed (`anchors` in `config/cards.yaml`)
+
+Placements used to be an 18×24 **grid** — ~4300 actions — which could not express the tiles this deck
+is decided by. An X-Bow's 4-tile and 5-tile placements reach the enemy tower and one row further back
+does not, and the coarsened grid had no cell boundary in the right place; 87db21c's adaptive
+split-push opponents punish exactly that imprecision.
+
+Each card now has a small set of **named anchors** — `x_bow.4tile_left`, `tornado.king_activate`,
+`knight.bridge_right` — and the action is *(card identity, anchor)*. **45 placements instead of
+~4300**, every one a play you could describe out loud, and no illegal positions to clamp or mask.
+
+An anchor is a **tile offset from a calibrated landmark**, not a raw tile index:
+
+```yaml
+- {name: 4tile_left, from: bridge_left, offset: [0, 4]}   # 4 tiles behind the left bridge
+```
+
+Landmarks come straight from `env.my_towers` / `env.enemy_towers`, so they sit exactly where the sim
+engine and the live reward already believe they do; only the offset is scaled by tile size.
+
+**Check them before training** — tile-exactness is the whole point, and an anchor one tile off is worse
+than a grid cell because the policy will trust it:
+
+```powershell
+run.py verify --anchors
+```
+
+It overlays every anchor on a real frame (one image per card, plus landmarks) and cross-checks them
+against the reward geometry. Checkpoints record their anchor set; `train-rl` and `play` refuse a
+mismatch rather than place cards on the wrong tiles.
 
 ## Setup
 

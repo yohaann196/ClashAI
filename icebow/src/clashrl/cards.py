@@ -52,6 +52,9 @@ class CardDB:
         self.meta: dict = data.get("meta", {})
         self._deck: dict = data.get("deck", {})
         curated: Dict[str, dict] = data.get("cards", {})
+        # ACTION ANCHORS: per-card named placements (see clashrl/actions.py). Kept out of `cards` so
+        # tactical placement data never collides with the imported stat fields.
+        self.anchors: Dict[str, list] = dict((data.get("anchors") or {}).get("cards", {}) or {})
 
         # Merge imported stats (base layer) with curated entries. Curated fields
         # win; null curated fields never clobber a real imported value.

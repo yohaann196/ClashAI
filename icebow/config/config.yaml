@@ -279,20 +279,18 @@ observation:
 
 # --- Discrete action space (card slot x placement grid) ------------------
 action:
-  grid: [18, 24]                 # placement grid: columns x rows. COARSENED 32->24 rows (576->432 cells) to shrink
-                                 # the action space so DQN explores it faster (the 18x32 one-cell-per-tile grid
-                                 # plateaued ~54% below the old coarse-grid peak -- testing if 576 was too fine).
-                                 # NOTE: no longer exactly one cell per board tile (18 wide x 32 tall); rows are grouped.
-  arena_box: [0.03, 0.10, 0.97, 0.86]  # normalized [x0,y0,x1,y1] of the arena PLAYFIELD the grid is anchored to
-                                 # (defaults to env.arena_region if unset). Calibrate to the visible grass corners so
-                                 # a cell centre lines up with a tile centre; the board's mild perspective makes this
-                                 # a close approximation, not a pixel-exact map. Changing grid/arena_box needs a RETRAIN.
-  deploy_top: 0.44               # troops can only deploy on YOUR half (below the river); a cell above this y is clamped
-                                 # DOWN so the card actually deploys (spells target anywhere). 0.44 (was 0.47) opens the
-                                 # central grass just below the river -- the deployable space in front of your towers.
-  king_avoid_half: [0.09, 0.06]  # half-size of YOUR king tower's footprint (around the my_towers king anchor). A troop
-                                 # cell landing on it is pulled to the row just in front -- you can't deploy on your own tower.
-  princess_avoid_half: [0.06, 0.05]  # same, per each of YOUR two PRINCESS towers (my_towers[0..1]) -- smaller footprint than the king
+  # The placement GRID is GONE. It was 18x24 cells (~4300 actions with 10 cards) and it could not
+  # express the tiles this deck is decided by -- an X-Bow's 4-tile vs 5-tile placement -- while
+  # 87db21c's adaptive split-push opponents punish exactly that imprecision. Placements are now
+  # PER-CARD NAMED ANCHORS defined in config/cards.yaml under `anchors:`; see src/clashrl/actions.py.
+  # Removed with the grid: `grid`, `deploy_top`, `king_avoid_half`, `princess_avoid_half` -- every
+  # anchor is a legal, deliberate position, so there is nothing to clamp or mask out.
+  arena_box: [0.03, 0.10, 0.97, 0.86]  # normalized [x0,y0,x1,y1] of the arena PLAYFIELD (defaults to
+                                 # env.arena_region if unset). This now sets ONE THING: the TILE SIZE that
+                                 # anchor offsets are measured in (the box spans Clash Royale's 18x32 tile
+                                 # board). Anchors hang off calibrated LANDMARKS -- tower centres, bridges,
+                                 # the river -- so an imperfect box shifts an anchor by a fraction of a tile
+                                 # instead of relocating it. Calibrate with: run.py verify --anchors
 
 # --- Reward shaping (RL fine-tune) ---------------------------------------
 # CORRECTNESS-FIRST: the model is rewarded for PLAYING THE GAME CORRECTLY (read the
@@ -497,7 +495,12 @@ env:
   defense_threat_frac: 0.02            # min enemy (red) mass in a half of your side to call it "threatened" (lane read)
   wrong_lane_margin: 0.12              # deadband around the 0.48 lane split before a placement counts as wrong-lane (threat_response)
   # X-Bow (win condition) placement geometry: forward within tower range, or the CENTER INTERCEPT band for defence.
-  xbow_range: 0.36                     # max normalized distance from the X-Bow to an enemy princess for it to REACH the tower (~11.5 tiles)
+  xbow_range: 0.42                     # max normalized distance from the X-Bow to an enemy princess for it to REACH the tower (~11.5 tiles).
+                                       # RAISED 0.36 -> 0.42 when the placement GRID was replaced by named anchors: the canonical
+                                       # 4-tile and 5-tile X-Bow anchors sit 0.390 / 0.414 from the nearest enemy princess, so at 0.36
+                                       # the OFFENSIVE reward scored the deck's two signature placements as MISPLACES -- training the
+                                       # policy against the very anchors that exist to express them. `verify --anchors` cross-checks
+                                       # this and prints any anchor/reward conflict; re-run it after moving an anchor or this value.
   xbow_defense_front: 0.52             # DEFENSIVE "back-centre" band: from just behind the bridge (the central Tesla area)...
   xbow_defense_back: 0.62              # ...down to ~your princess-tower line. BEHIND the towers (deeper) is rarely useful ->
                                        #    earns only rewards.xbow_deep_frac of the win-condition credit (soft nudge, not a punishment)

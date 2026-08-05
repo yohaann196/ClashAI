@@ -66,9 +66,18 @@ def train_bc(cfg, init: str | None = None, iterations: int = 1) -> None:
               "(`hand-templates`), then `record` and `label --all`.")
         return
 
-    gw, gh = int(grid[0]), int(grid[1])
-    n_cells = gw * gh
+    # ACTION SPACE: per-card named anchors (clashrl/actions.py). The dataset stores an ANCHOR INDEX
+    # per play (label.py quantizes the recorded click onto the card's anchor list), so the placement
+    # head is `n_anchors` wide -- not a grid.
+    from .actions import AnchorSpace
+    _aspace = AnchorSpace(cfg)
+    n_anchors = _aspace.n_anchors
     n_cards = int(hands.shape[1])
+    if acts.shape[1] < 3:
+        print("[train-bc] this dataset was labelled for the OLD 18x24 placement GRID (acts have "
+              f"{acts.shape[1]} columns, anchors need 3). Re-run `run.py label --all` to rebuild it "
+              "against the current anchors.")
+        return
     if deck is None:
         deck = [f"card{i}" for i in range(n_cards)]
 
@@ -102,7 +111,7 @@ def train_bc(cfg, init: str | None = None, iterations: int = 1) -> None:
     elx = torch.from_numpy(elixirs).float()
     thr = torch.from_numpy(threats).float()
     card = torch.from_numpy(acts[:, 0].astype("int64"))
-    cell = torch.from_numpy((acts[:, 2] * gw + acts[:, 1]).astype("int64"))  # gy*gw + gx
+    cell = torch.from_numpy(acts[:, 1].astype("int64"))          # anchor index within the card
 
     loader = DataLoader(TensorDataset(x, hand, nxt, elx, thr, card, cell),
                         batch_size=int(cfg.get("train", "batch_size", default=64)),
@@ -117,7 +126,7 @@ def train_bc(cfg, init: str | None = None, iterations: int = 1) -> None:
         print(f"[train-bc] NOTE: observation.obs_mode is '{semantic.obs_mode(cfg)}', but behaviour cloning "
               "trains on recorded pixels -> this checkpoint is RGB. Warm-start the semantic policy from "
               "train-sim instead (run.py train-sim, then train-rl --init data/policy_sim_best.pt).")
-    net = PolicyNet(in_ch=3, n_cards=n_cards, n_cells=n_cells, threat_dim=threat_dim).to(device)
+    net = PolicyNet(in_ch=3, n_cards=n_cards, n_anchors=n_anchors, threat_dim=threat_dim).to(device)
     if init:                                     # WARM-START: fine-tune an existing policy instead of random init
         ip = cfg.path(init)                      # e.g. data/policy_sim.pt -> combine the SIM prior with your recordings
         if not ip.exists():
@@ -126,7 +135,7 @@ def train_bc(cfg, init: str | None = None, iterations: int = 1) -> None:
             ck = torch.load(ip, map_location="cpu")
             ck_deck = ck.get("deck")
             decks_match = ck_deck is not None and [str(c) for c in ck_deck] == [str(c) for c in deck]
-            if (ck.get("n_cards") == n_cards and ck.get("n_cells") == n_cells
+            if (ck.get("n_cards") == n_cards and ck.get("n_anchors") == n_anchors
                     and ck.get("threat_dim") == threat_dim and decks_match):
                 try:
                     net.load_state_dict(ck["model"])
@@ -168,14 +177,14 @@ def train_bc(cfg, init: str | None = None, iterations: int = 1) -> None:
                 cc += (cell_logits.argmax(1) == cellb).sum().item()
             tag = f"it {it}/{iterations} " if iterations > 1 else ""
             print(f"[train-bc] {tag}epoch {ep}/{epochs}  loss {tot / n:.3f}  "
-                  f"card_acc {sc / n:.2f}  cell_acc {cc / n:.2f}")
+                  f"card_acc {sc / n:.2f}  anchor_acc {cc / n:.2f}")
 
         torch.save({
             "model": net.state_dict(),
-            "grid": [gw, gh],
+            "action_space": _aspace.signature(),
             "arena_size": list(cfg.get("observation", "arena_size", default=[64, 96])),
             "n_cards": n_cards,
-            "n_cells": n_cells,
+            "n_anchors": n_anchors,
             "threat_dim": threat_dim,
             "deck": deck,
             "obs_mode": "rgb", "in_ch": 3,     # BC learns from recorded pixels (see the note above)

@@ -918,3 +918,92 @@ cards:
   goblin_demolisher: {range: long, flags: [ranged, splash, death_damage], verified: false}
   goblinstein: {range: melee, flags: [tank, building_targeting, stun], verified: false}  # front melee tank (NOT a win condition); rear ranged + stun
   spirit_empress: {range: melee, verified: false}                               # GROUND form (3e single-target melee); air form is ranged flying
+
+# =====================================================================================================
+# ACTION ANCHORS -- the policy's placement action space (see src/clashrl/actions.py).
+# =====================================================================================================
+# The 18x24 placement GRID (~4300 actions) could not express the tiles this deck is decided by: an
+# X-Bow's value depends on WHICH TILE it lands on, and a 24-row grid does not even have a boundary in
+# the right place. 87db21c's adaptive split-push opponents punish exactly that imprecision. So each card
+# now gets a small set of NAMED anchors and the action is (card identity, anchor).
+#
+# Each anchor is a TILE OFFSET FROM A NAMED LANDMARK, not a raw tile index:
+#     {name: 4tile_left, from: bridge_left, offset: [dcol, drow]}
+# Landmarks (tower centres, bridges, river) come straight from env.my_towers / env.enemy_towers in
+# config.yaml -- already calibrated, and shared with the sim engine and the live reward. Only the
+# OFFSET is scaled by the tile size, so an imperfect action.arena_box shifts an anchor by a fraction of
+# a tile instead of relocating it across the board.
+#
+#   offset = [dcol, drow]   +dcol = RIGHT,  +drow = toward YOUR baseline (down-screen)
+#   Tiles are Clash Royale's real 18x32 lattice. The policy always acts from team 0's point of view.
+#
+# VERIFY BEFORE TRAINING:  run.py verify --anchors
+# It overlays every anchor on real in-match frames and flags any that conflict with the reward geometry
+# (X-Bow in range / in the defensive band). Tile-exactness is the whole point -- an anchor one tile off
+# is worse than a grid cell, because the policy will trust it.
+anchors:
+  cards:
+
+    # X-BOW -- the win condition. The two canonical siege distances behind the river, per lane, plus the
+    # defensive centre placement the reward's `_defensive` phase expects (env.xbow_defense_front/back).
+    x_bow:
+      - {name: 4tile_left,       from: bridge_left,       offset: [0, 4]}
+      - {name: 4tile_right,      from: bridge_right,      offset: [0, 4]}
+      - {name: 5tile_left,       from: bridge_left,       offset: [0, 5]}
+      - {name: 5tile_right,      from: bridge_right,      offset: [0, 5]}
+      - {name: defensive_centre, from: river_centre,      offset: [0, 4]}
+
+    # TESLA -- centre pull drags a push off the lane into both towers' range; the pockets defend one side.
+    tesla:
+      - {name: centre_pull,      from: river_centre,      offset: [0, 5]}
+      - {name: left_pocket,      from: my_left_tower,     offset: [2, -1]}
+      - {name: right_pocket,     from: my_right_tower,    offset: [-2, -1]}
+
+    # ICE WIZARD -- support placed BEHIND the tower so it survives and slows the whole push.
+    ice_wizard:
+      - {name: behind_left_tower,  from: my_left_tower,   offset: [0, 2]}
+      - {name: behind_right_tower, from: my_right_tower,  offset: [0, 2]}
+      - {name: centre_back,        from: my_king,         offset: [0, -1]}
+
+    # KNIGHT -- bridge spots for offence/pressure, tower spots to body-block a push.
+    knight:
+      - {name: bridge_left,      from: bridge_left,       offset: [0, 1]}
+      - {name: bridge_right,     from: bridge_right,      offset: [0, 1]}
+      - {name: defend_left,      from: my_left_tower,     offset: [0, -2]}
+      - {name: defend_right,     from: my_right_tower,    offset: [0, -2]}
+      - {name: centre_block,     from: river_centre,      offset: [0, 4]}
+
+    # ROCKET -- goes ANYWHERE, so the target set spans both halves: the three enemy towers, both
+    # bridges (a staged push), and your own defensive tiles (rocketing a push that already crossed).
+    rocket:
+      - {name: enemy_left_tower,  from: enemy_left_tower, offset: [0, 0]}
+      - {name: enemy_right_tower, from: enemy_right_tower, offset: [0, 0]}
+      - {name: enemy_king,        from: enemy_king,       offset: [0, 0]}
+      - {name: enemy_bridge_left, from: bridge_left,      offset: [0, -2]}
+      - {name: enemy_bridge_right, from: bridge_right,    offset: [0, -2]}
+      - {name: defend_left,       from: my_left_tower,    offset: [0, -3]}
+      - {name: defend_right,      from: my_right_tower,   offset: [0, -3]}
+
+    # TORNADO -- pull points. king_activate drags a push into your king's range to wake it (once per
+    # match, deliberately); the lane pulls gather a push for Ice Wizard splash / a centre Rocket.
+    tornado:
+      - {name: king_activate,    from: my_king,           offset: [0, -2]}
+      - {name: pull_left,        from: my_left_tower,     offset: [1, -2]}
+      - {name: pull_right,       from: my_right_tower,    offset: [-1, -2]}
+      - {name: bridge_left,      from: bridge_left,       offset: [0, 1]}
+      - {name: bridge_right,     from: bridge_right,      offset: [0, 1]}
+
+    # THE LOG -- rolls FORWARD (up-screen), so it is cast BELOW the troops it should sweep.
+    the_log:
+      - {name: lane_left,        from: my_left_tower,     offset: [0, -3]}
+      - {name: lane_right,       from: my_right_tower,    offset: [0, -3]}
+      - {name: bridge_left,      from: bridge_left,       offset: [0, 1]}
+      - {name: bridge_right,     from: bridge_right,      offset: [0, 1]}
+
+    # SKELETONS -- split behind the towers to cycle, or dropped in front to body-block.
+    skeletons:
+      - {name: split_left,       from: my_left_tower,     offset: [0, 2]}
+      - {name: split_right,      from: my_right_tower,    offset: [0, 2]}
+      - {name: block_left,       from: my_left_tower,     offset: [0, -2]}
+      - {name: block_right,      from: my_right_tower,    offset: [0, -2]}
+      - {name: centre_block,     from: river_centre,      offset: [0, 3]}

@@ -42,20 +42,17 @@ def train_sim(cfg, matches: int = 2000, resume: bool = False, seed: int = 0, env
     K = max(1, int(envs if envs is not None else cfg.get("sim", "envs", default=8)))
     pool = [SimMatchEnv(cfg, seed=seed + i) for i in range(K)]
     e0 = pool[0]
-    n_cards, n_cells, threat_dim = e0.n_cards, e0.n_cells, e0.threat_dim
-    gw, gh = e0.gw, e0.gh
+    n_cards, n_anchors, threat_dim = e0.n_cards, e0.n_anchors, e0.threat_dim
     device = _pick_device(cfg)
-    net = _build_net(cfg, device, n_cards, n_cells, threat_dim)
+    net = _build_net(cfg, device, n_cards, n_anchors, threat_dim)
 
-    # DEPLOYABLE cell mask (impossible-coordinate fix, mirrors train_rl + play): anywhere cards
-    # (rocket / miner) -> any cell; every other card only YOUR half. Applied before the cell argmax in
-    # choose_batch / choose_greedy AND in the DDQN target, so the policy never selects (or bootstraps
-    # from) an enemy-half cell that would just clamp / no-op.
-    anywhere_ids = set(e0.anywhere_ids)
-    yourhalf_mask = torch.tensor(e0.actions.deployable_mask(False), dtype=torch.bool, device=device)
-    allcells_mask = torch.ones(n_cells, dtype=torch.bool, device=device)
-    yourhalf_cells = [c for c in range(n_cells) if bool(yourhalf_mask[c])]
-    anywhere_ids_t = torch.tensor(sorted(anywhere_ids), dtype=torch.long, device=device)
+    # PER-CARD ANCHOR MASK [n_cards, n_anchors] (mirrors train_rl + play). With named anchors there are
+    # no illegal placements to mask out -- only head slots a given card does not use, since the head is
+    # as wide as the WIDEST card's anchor list. Applied before the placement argmax in choose_batch /
+    # choose_greedy AND in the DDQN target, so the policy never selects or bootstraps from a slot that
+    # does not correspond to a real anchor for that card.
+    anchor_mask = torch.tensor(e0.actions.mask_table(), dtype=torch.bool, device=device)
+    anchor_counts = [e0.actions.count(c) for c in range(n_cards)]
     # per-card elixir costs: greedy + random picks are masked to AFFORDABLE cards (an unaffordable
     # pick just no-ops in the env = a wasted turn -- the eval audit showed rejected tornado attempts)
     card_costs = [float(s.elixir) for s in e0.specs]
@@ -78,7 +75,7 @@ def train_sim(cfg, matches: int = 2000, resume: bool = False, seed: int = 0, env
                  else " (no stored best -- back up policy_sim_best.pt once before relying on it)"))
     else:
         print(f"[train-sim] training FROM SCRATCH ({sim_path.name} will be written)")
-    target = _build_net(cfg, device, n_cards, n_cells, threat_dim)
+    target = _build_net(cfg, device, n_cards, n_anchors, threat_dim)
     target.load_state_dict(net.state_dict())
     target.eval()
 
@@ -174,8 +171,7 @@ def train_sim(cfg, matches: int = 2000, resume: bool = False, seed: int = 0, env
                     else:
                         c = random.choice(playable)
                     play_counts[c] += 1.0
-                    cells = list(range(n_cells)) if c in anywhere_ids else (yourhalf_cells or list(range(n_cells)))
-                    acts.append((1, c, random.choice(cells)))
+                    acts.append((1, c, random.randrange(max(1, anchor_counts[c]))))
                 continue
             # greedy: only cards that are in hand AND affordable (an unaffordable pick just no-ops in
             # the env = a wasted turn the policy can't learn from)
@@ -183,8 +179,7 @@ def train_sim(cfg, matches: int = 2000, resume: bool = False, seed: int = 0, env
             if not torch.isfinite(cq_i).any():
                 acts.append((0, 0, 0)); continue
             ci = int(cq_i.argmax())
-            cmask = allcells_mask if ci in anywhere_ids else yourhalf_mask   # DEPLOYABLE cells for this card
-            ceq_i = ceq[i].masked_fill(~cmask, float("-inf"))
+            ceq_i = ceq[i].masked_fill(~anchor_mask[ci], float("-inf"))   # this card's anchors only
             if gq[i, 0] >= gq[i, 1] + cq_i.max() + ceq_i.max():
                 acts.append((0, 0, 0))
             else:
@@ -217,11 +212,7 @@ def train_sim(cfg, matches: int = 2000, resume: bool = False, seed: int = 0, env
             cqn, ceqn, gqn = net(nobs, nhand, nnxt, nelx, nthr)
             cqn = cqn.masked_fill(nhand < 0.5, float("-inf"))
             sel_card = cqn.argmax(1, keepdim=True)
-            if anywhere_ids_t.numel():                          # DEPLOYABLE cells for the selected next-card
-                any_next = (sel_card == anywhere_ids_t.view(1, -1)).any(1, keepdim=True)
-            else:
-                any_next = torch.zeros_like(sel_card, dtype=torch.bool)
-            cellmask_next = torch.where(any_next, allcells_mask.unsqueeze(0), yourhalf_mask.unsqueeze(0))
+            cellmask_next = anchor_mask[sel_card.squeeze(1)]    # the selected next-card's own anchors
             ceqn = ceqn.masked_fill(~cellmask_next, float("-inf"))
             sel_cell = ceqn.argmax(1, keepdim=True)
             play_next = (gqn[:, 1] + cqn.max(1).values + ceqn.max(1).values) > gqn[:, 0]
@@ -240,7 +231,9 @@ def train_sim(cfg, matches: int = 2000, resume: bool = False, seed: int = 0, env
         p = path if path is not None else sim_path
         p.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"model": net.policy.state_dict(), "gate": net.gate.state_dict(),
-                    "grid": [gw, gh], "n_cards": n_cards, "n_cells": n_cells,
+                    # ACTION SPACE identity -- train-rl / play refuse a checkpoint whose anchors differ
+                    "action_space": e0.actions.signature(),
+                    "n_cards": n_cards, "n_anchors": n_anchors,
                     "threat_dim": threat_dim, "deck": e0.deck_keys, "best_wr": best_wr,
                     # OBSERVATION LAYOUT this policy can read (clashrl.semantic). train-rl / play
                     # refuse a checkpoint whose mode doesn't match the config.
@@ -262,7 +255,7 @@ def train_sim(cfg, matches: int = 2000, resume: bool = False, seed: int = 0, env
     _prog = {"n": 0}
 
     def snapshot(store=True):
-        snap = _build_net(cfg, device, n_cards, n_cells, threat_dim)
+        snap = _build_net(cfg, device, n_cards, n_anchors, threat_dim)
         snap.load_state_dict(net.state_dict())
         snap.eval()
         for p in snap.parameters():
@@ -335,8 +328,7 @@ def train_sim(cfg, matches: int = 2000, resume: bool = False, seed: int = 0, env
             if not torch.isfinite(cq_i).any():                   # nothing affordable -> wait
                 acts.append((0, 0, 0)); continue
             ci = int(cq_i.argmax())
-            cmask = allcells_mask if ci in anywhere_ids else yourhalf_mask
-            ceq_i = ceq[i].masked_fill(~cmask, float("-inf"))
+            ceq_i = ceq[i].masked_fill(~anchor_mask[ci], float("-inf"))
             if gq[i, 0] >= gq[i, 1] + cq_i.max() + ceq_i.max():
                 acts.append((0, 0, 0))
             else:
@@ -379,7 +371,7 @@ def train_sim(cfg, matches: int = 2000, resume: bool = False, seed: int = 0, env
     running = {"v": True}
     signal.signal(signal.SIGINT, lambda *_a: running.update(v=False))
     print(f"[train-sim] {device}: {K} vectorized env(s), up to {matches} matches "
-          f"(cards={n_cards}, cells={n_cells}). Ctrl+C to stop + save.")
+          f"(cards={n_cards}, anchors<={n_anchors}). Ctrl+C to stop + save.")
     step = 0
     done_n = wins = losses = draws = 0
     win_hist: deque = deque(maxlen=max(log_every, 50))
