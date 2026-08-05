@@ -184,6 +184,12 @@ def _cmd_obs_diversity(args) -> None:
     obs_diversity(_sized_config(args), args.ckpt, args.frames, args.session, args.mode, args.conf)
 
 
+def _cmd_ablate_rewards(args) -> None:
+    from .ablate import ablate_rewards
+    ablate_rewards(_sized_config(args), args.matches, args.seeds, args.envs, args.terms,
+                   args.eval_matches, args.out, args.resume, args.dry_run, args.verbose)
+
+
 def _cmd_card_roles(args) -> None:
     from .card_threat import roles_report
     roles_report(Config.load(args.config), args.all, args.card)
@@ -360,6 +366,21 @@ def main() -> None:
     odv.add_argument("--conf", type=float, default=None, help="detector confidence (default: observation.detector_conf)")
     odv.add_argument("--size", choices=sorted(_GRID_SIZES), default=None, help="board resolution preset")
     odv.set_defaults(func=_cmd_obs_diversity)
+
+    abl = sub.add_parser("ablate-rewards",
+                         help="measure each reward shaping term: train with it zeroed, score on the frozen eval pool, rank by delta")
+    abl.add_argument("--matches", type=int, default=4000, help="train-sim matches per run (the sweep's dominant cost)")
+    abl.add_argument("--seeds", type=int, default=3, help="seeds per arm (>=2 needed for a confidence interval)")
+    abl.add_argument("--envs", type=int, default=8, help="vectorized envs per run")
+    abl.add_argument("--eval-matches", dest="eval_matches", type=int, default=48,
+                     help="frozen non-adaptive benchmark matches used to score each run")
+    abl.add_argument("--terms", default=None, help="comma-separated subset to ablate (default: all; shards a sweep)")
+    abl.add_argument("--out", default=None, help="results JSON (default: runs/ablate/rewards.json)")
+    abl.add_argument("--resume", action="store_true", help="skip runs already present in the results JSON")
+    abl.add_argument("--dry-run", dest="dry_run", action="store_true", help="print the plan and exit")
+    abl.add_argument("--verbose", action="store_true", help="show each train-sim's own output")
+    abl.add_argument("--size", choices=sorted(_GRID_SIZES), default=None, help="board resolution preset")
+    abl.set_defaults(func=_cmd_ablate_rewards)
 
     crl = sub.add_parser("card-roles",
                          help="review the strategic role (win condition / siege / spell / ...) derived from the KB for every detector class")

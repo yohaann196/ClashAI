@@ -1200,6 +1200,64 @@ Newest entries are at the bottom.
 
 
 ------------------------------------------------------------------------------
+2026-08-04  —  REWARD ABLATION HARNESS + potential-based (Ng et al.) shaping
+------------------------------------------------------------------------------
+- WHY. `rewards:` grew one term at a time (87db21c alone added four tornado terms) and not one term has
+  ever been shown to help. Each is a hyperparameter, an interaction surface with every other term, and
+  a farming opportunity -- correctness_cap exists ONLY because the dense terms are farmable.
+- NEW `run.py ablate-rewards` (clashrl/ablate.py). For each shaping term + a BASELINE: train a fresh
+  policy from scratch with that term zeroed, score it on the FROZEN NON-ADAPTIVE eval pool, repeat over
+  seeds, rank by delta = winrate(removed) - winrate(baseline). NEGATIVE delta = the term earns its
+  place; POSITIVE = it is actively harmful; CI crossing zero = no measurable effect at that budget.
+  22 arms incl. GROUPS (nado_group, threat_group, cycle_group, wincon_group -- individually the four
+  nado terms are too small/rare to resolve) and `all_shaping` as the sparse-reward control.
+  Four things it deliberately gets right, each of which would otherwise silently invalidate the table:
+    * scores the FINAL checkpoint, never _best.pt (which is selected ON this benchmark = selection bias)
+    * seeds `random`/`numpy`/`torch` per run -- train_sim's exploration draws from the GLOBAL `random`
+      module, so a `seed=` argument alone does NOT make a run reproducible and the variance column
+      would be measuring uncontrolled noise
+    * frozen non-adaptive pool (opponent_provider=None, rng.seed(777+j), canonical render)
+    * Welch CI + explicit verdict per row; with few seeds most rows SHOULD read "inconclusive"
+  Resumable (--resume, JSON after every run), sharded (--terms), --dry-run for the plan.
+- CORRECTION to a long-standing comment: there is NO `troop_defeat` term in this codebase and never has
+  been. The two terms the code DESCRIBES as potential-based are not, in the Ng et al. sense:
+    * elixir_trade uses prev_enemy_value - enemy_value -- a potential difference, but it omits `gamma`,
+      CLIPS to +-trade_cap (which destroys the telescoping the invariance depends on) and adds `-spent`,
+      an action cost that is not a function of state at all.
+    * tower_chip_scale (chip_progress deltas) is the closest thing to correct -- clean, unclipped -- but
+      it too omits `gamma`.
+  So "follow that pattern" would have propagated the bug; the conversion below fixes both.
+- NEW clashrl/shaping.py: F = gamma*Phi(s') - Phi(s), with Phi(absorbing) = 0 so the discounted shaping
+  return telescopes to exactly -Phi(s_0) -- a constant fixed by the start state, identical for every
+  policy. Potentials (inheriting the SAME config weights so ablation numbers carry over):
+    trade  (my_elixir - enemy_value)/value_norm | chip  chip_progress differential
+    threat -(severity of pressure you hold no answer to) | wincon +(win condition established)
+    cycle  +(you hold an answer to the threat) | leak -(elixir at cap)
+  Note `trade` puts YOUR elixir in the potential, so committing 6 elixir lowers Phi and regen restores
+  it -- which is why the old `-spent` action cost is neither needed nor wanted.
+  correctness_cap is DISABLED under potential mode: unnecessary (the theorem forbids farming) and
+  harmful (a path-dependent clamp is not a function of state and breaks the invariance).
+  DROPPED as subsumed: spell_waste (a whiff already reads as elixir spent for nothing in `trade`) and
+  nado_clump/combo/retarget (measured from a post-cast watch list = functions of HISTORY, not state, so
+  no Phi can express them; their effects surface in `trade` + `threat`). NOT subsumed:
+  nado_king_activate -- waking your own king is invisible to every potential, so if the ablation says
+  it earns its place it must stay a declared non-potential term.
+  win/loss/take_enemy_tower/lose_own_tower stay ordinary sparse rewards -- they are the task.
+- VERIFIED numerically: tools/potential_invariance.py runs 6 behaviourally-different policies from ONE
+  fixed start state; all six return shaping = -Phi(s_0) to ~1e-16, spread 1.1e-15. Control: the CLASSIC
+  reward over the same 6 policies spreads 3.77 (policy-dependent, as expected -- without this the first
+  test would prove nothing). Also checks Phi is finite and a pure function of state.
+  Observable side-effect of a correct conversion: train-sim avg_rew moved -15.7 -> +0.5, i.e. tens of
+  points of accumulated dense shaping collapsed to the constant it is supposed to be.
+- DEFAULT OFF (rewards.potential_based.enabled: false). Which terms survive is exactly what the
+  ablation answers and this module cannot -- run the sweep, delete what does not earn its place, then
+  enable the survivors' components.
+- LIMITATION: SIM ONLY. The potentials read engine ground truth; the live env needs perception-side
+  equivalents (enemy mass from pixels, TowerHpTracker for the chip potential) before train-rl matches.
+  env.py prints a loud warning if potential_based is on, rather than diverging silently.
+
+
+------------------------------------------------------------------------------
 Notes / caveats
 ------------------------------------------------------------------------------
 - Reward-shaping changes only take effect after an RL run (`train-rl`) — they
