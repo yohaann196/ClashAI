@@ -180,6 +180,12 @@ def _cmd_ablate_rewards(args) -> None:
                    args.eval_matches, args.out, args.resume, args.dry_run, args.verbose)
 
 
+def _cmd_divergence(args) -> None:
+    from .divergence import divergence
+    divergence(Config.load(args.config), args.session, args.stride, args.conf,
+               args.all_mechanics, args.out, args.verbose)
+
+
 def _cmd_card_roles(args) -> None:
     from .card_threat import roles_report
     roles_report(Config.load(args.config), args.all, args.card)
@@ -360,6 +366,17 @@ def main() -> None:
     abl.add_argument("--dry-run", dest="dry_run", action="store_true", help="print the plan and exit")
     abl.add_argument("--verbose", action="store_true", help="show each train-sim's own output")
     abl.set_defaults(func=_cmd_ablate_rewards)
+
+    dvg = sub.add_parser("divergence",
+                         help="measure how far sim/engine.py drifts from a REAL recorded match, and rank which mechanics the drift is most sensitive to")
+    dvg.add_argument("--session", default=None, help="session folder (default: latest)")
+    dvg.add_argument("--stride", type=float, default=1.0, help="seconds between lockstep samples")
+    dvg.add_argument("--conf", type=float, default=None, help="detector confidence (default: observation.detector_conf)")
+    dvg.add_argument("--all-mechanics", dest="all_mechanics", action="store_true",
+                     help="ablate every mechanic, not just the core four (pathing/aggro/building-pull/body-block)")
+    dvg.add_argument("--out", default=None, help="write the full result to this JSON path")
+    dvg.add_argument("--verbose", action="store_true", help="print observation progress")
+    dvg.set_defaults(func=_cmd_divergence)
 
     crl = sub.add_parser("card-roles",
                          help="review the strategic role (win condition / siege / spell / ...) derived from the KB for every detector class")
