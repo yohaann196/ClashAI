@@ -1258,6 +1258,47 @@ Newest entries are at the bottom.
 
 
 ------------------------------------------------------------------------------
+2026-08-05  —  FIRST TESTS: pytest suite for the sim engine (+ a real swarm-placement bug it found)
+------------------------------------------------------------------------------
+- icebow/ had NO tests. The sim engine is where every sim-trained policy learns the game, so an error
+  in its model of Clash Royale means everything downstream optimises the wrong game, silently.
+- NEW icebow/tests/ (166 tests, `python -m pytest` from icebow/). Needs only pytest + PyYAML + numpy --
+  NO torch, NO OpenCV -- so it runs in CI without the training stack. pytest.ini sets pythonpath=src.
+  test_elixir (regen, 1x/2x/3x tiers + exact boundaries, 10-cap, card cost, match end),
+  test_combat (discrete hits, hit_dmg == dps*hit_speed, slow cadence, tower_hit_dmg vs hit_dmg, tower
+  fire), test_towers (destruction/overkill, crowns, king wake by damage AND by princess loss, overtime
+  tiebreak, tower level scaling), test_deploy (~1s delay, deploy immunity, swarm placement, building
+  lifetime), test_spells (Rocket point blast vs Log rolling corridor vs Tornado vortex: radius,
+  direction, knockback, drag rate, DoT total), test_stat_scaling_and_defenses (1.1^(lvl-11), shield
+  pools, Evo Knight damage reduction).
+- EVERY test names the CR mechanic it pins in its docstring ("CR mechanic: ..."). A test that cannot
+  name its mechanic is testing an implementation detail.
+- GOLDEN VALUES from config/cards_stats.json TWO ways, deliberately: RECOMPUTED from the published
+  fields (catches drift in build_spec) AND pinned as LITERALS -- Knight 1766/202/1.2s/168dps, Rocket
+  1484 with 371 crown, Log 266/40, Tornado 84/29 (catches drift in the stat file itself, which the
+  recompute tests cannot see). Neither alone is sufficient.
+- BUG FOUND AND FIXED -- MULTI-UNIT SPAWN PLACEMENT. deploy() computed its spread offsets as
+  `ox = x + (0.02 * ...)` and then used `x + ox`, i.e. `2x + offset`. For any normal placement that
+  clamped to the arena bound, so EVERY multi-unit card -- Skeletons (in this deck), Minions, Royal
+  Recruits, Skeleton Army, Barbarians -- spawned stacked at (0.97, 0.97) instead of where it was
+  played. Verified before the fix: Skeletons requested at (0.50, 0.60) spawned at (0.97, 0.97) x3.
+  Single-unit cards were unaffected (the n>1 branch never ran), which is why it survived this long.
+  BEHAVIOUR CHANGE: swarm cards now deploy where the policy asks, so sim dynamics shift -- existing
+  sim checkpoints were trained against corner-spawning swarms and should be retrained.
+- SUITE IS MUTATION-CHECKED, because a suite that never fails is worthless. Deliberately breaking each
+  covered mechanic in engine.py makes it fail: swarm offsets reverted, double-elixir threshold moved
+  10s, tornado last-tick pro-rating removed, Evo Knight reduction applied unconditionally, crown-tower
+  reduction removed, level scaling 1.1 -> 1.05, shield overflow carried into HP, king wake removed,
+  tornado drag 0.35 -> 0.50, Rocket reclassified as a roll, deploy delay removed. 11/11 caught.
+- TWO IMMOBILISE HELPERS, not interchangeable (this cost three test failures to learn): freeze() uses a
+  huge deploy delay -> cannot act, ignored by collision, and NOT TARGETABLE BY TOWERS (deploy immunity
+  is itself a pinned mechanic); park() uses a huge stun -> cannot act but still a legal tower target.
+- Regression guards for two previously-fixed bugs so they cannot come back: Rocket-as-a-roll (87db21c)
+  and Evo-Knight-as-a-shield-pool (5440e7b).
+- requirements.txt gains pytest; tests/README.md documents the conventions.
+
+
+------------------------------------------------------------------------------
 Notes / caveats
 ------------------------------------------------------------------------------
 - Reward-shaping changes only take effect after an RL run (`train-rl`) — they

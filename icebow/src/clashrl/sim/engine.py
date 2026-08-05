@@ -379,8 +379,13 @@ class SimEngine:
             return True
         n = max(1, spec.count)
         for i in range(n):
-            ox = x + (0.02 * ((i % 3) - 1)) if n > 1 else 0.0
-            oy = y + (0.02 * ((i // 3) - 0.5)) if n > 1 else 0.0
+            # OFFSETS from the placement point -- they must NOT re-include x/y, which are added below.
+            # They used to (`ox = x + ...`), so every multi-unit card resolved to `2x + offset` and was
+            # clamped into the arena corner: Skeletons, Minions, Royal Recruits, Skeleton Army and every
+            # other swarm spawned at (0.97, 0.97) instead of where they were played. See
+            # tests/test_deploy.py::test_multi_unit_card_spawns_a_cluster_at_the_placement_point.
+            ox = (0.02 * ((i % 3) - 1)) if n > 1 else 0.0
+            oy = (0.02 * ((i // 3) - 0.5)) if n > 1 else 0.0
             u = Unit(spec, team, min(max(x + ox, 0.03), 0.97), min(max(y + oy, 0.03), 0.97), spec.hp)
             u.deploy_left = spec.deploy_time              # ~1s before it can act (you can't instant-block)
             u.pulse_cd = spec.pulse_interval              # Evo Tesla: first area-shock after one interval
