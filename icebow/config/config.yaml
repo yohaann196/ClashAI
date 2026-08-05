@@ -184,6 +184,33 @@ observation:
   # recall-noise scoped); LIVE from the detector's tagged tracks. Flipping this WIDENS threat_dim (+12 ->
   # 46 with the detector blocks) = a FRESH train-sim + re-label, so flip it at the NEXT from-scratch run.
   use_interactions: true
+  # --- OPPONENT ELIXIR + CYCLE (clashrl/opp_elixir.py) -------------------------------------------
+  # A human plays by COUNTING THE OPPONENT'S ELIXIR; the policy has never seen it. Elixir is an
+  # accumulator with known dynamics -- e(t) = clamp(e0 + integral(rate) - sum(costs), 0, 10), with e0=5
+  # and rate exactly known -- so the only unknown is which cards they played and when. Live that comes
+  # from the detector, which MISSES things, so this tracks an INTERVAL [lo, hi] + a confidence scalar
+  # rather than pretending to a point estimate: `hi` is a genuine upper bound (a missed spend can only
+  # make the truth lower) and `lo` subtracts an allowance sized from the detector's MEASURED RECALL.
+  # It SELF-CORRECTS at the cap: the 10-elixir ceiling is an absorbing state that erases history, so
+  # sustained idle at the cap collapses the interval back to a confident point.
+  # The 8-feature block (OPP_ELIXIR_DIM) appended to the threat vector: lo, hi, confidence, ELIXIR
+  # ADVANTAGE, CAN-THEY-AFFORD-WINCON, wincon cycle soonness, at-the-cap, their-deck coverage.
+  # CRITICAL: the SIM runs this SAME estimator on deploys CORRUPTED to the detector's recall/precision
+  # -- it is never fed engine ground-truth elixir. Handing the policy exact opponent elixir in training
+  # would teach it to lean on precision it does not have live, and the failure would only show up on
+  # the ladder. The corruption uses a PRIVATE rng (the 5cdf867 DomainRand pattern), and its seed is
+  # drawn UNCONDITIONALLY so seeded eval streams are bit-identical with this on or off.
+  # Flipping this WIDENS threat_dim (+8 -> 54 with the detector + interaction blocks) = a FRESH
+  # train-sim, then train-rl --init from it.
+  use_opponent_elixir: true
+  opponent_elixir:
+    deploy_delay_s: 1.0     # a troop is visible ~1s AFTER the elixir left their bar; the estimator
+                            # rewinds regen by this, applies the cost (so the CAP is applied at the
+                            # right instant), then rolls regen forward again
+    cap_hold_s: 3.0         # seconds pinned at 10 with no observed deploy before the interval collapses
+    assumed_recall: null    # interval width is sized from this; null = follow sim_detector_recall, so
+                            # live and sim agree about how uncertain to be. Re-measure per detector.
+    max_allowance: 10.0     # ceiling on the missed-spend allowance (the interval can never exceed the bar)
   # --- DOMAIN RANDOMIZATION of the sim's synthetic render (sim2real for the CNN branch) ---
   # Per-MATCH restyle (stable within a match, different across matches, like arena rotation):
   # background/river palette jitter, mild team-colour jitter (blue-vs-red identity is SIGNAL),

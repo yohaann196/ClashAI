@@ -34,6 +34,7 @@ from .nav import MenuNavigator
 from .threats import ThreatTracker, Threat
 from . import card_threat
 from . import interactions
+from . import opp_elixir
 from . import semantic
 from .cycle import CycleTracker
 from .tower_hp import TowerHpTracker
@@ -211,6 +212,14 @@ class LiveMatchEnv:
             enemy_window_s=float(cfg.get("observation", "team_enemy_window_s", default=4.0)),
             track_radius=float(cfg.get("observation", "team_track_radius", default=0.12)),
             forget_s=float(cfg.get("observation", "team_forget_s", default=4.5)))
+        # OPPONENT ELIXIR + CYCLE (clashrl/opp_elixir.py) -- live twin of the sim's estimator. Both
+        # sides run the SAME class; only the deploy source differs (detector here, corrupted ground
+        # truth there), which is what keeps the sim prior honest about how precise this signal is.
+        self.use_opp_elixir = bool(cfg.get("observation", "use_opponent_elixir", default=False))
+        self.opp_elixir = opp_elixir.OpponentElixir(cfg, db) if self.use_opp_elixir else None
+        self.opp_cycle = opp_elixir.EnemyCycleTracker(db) if self.use_opp_elixir else None
+        self._deploy_obs = opp_elixir.DeployObserver() if self.use_opp_elixir else None
+        self._opp_prev_t = None
         # Stage-3b gate: the troop-INTERACTION block (predicted tower pressure) -- live twin of the sim's
         self.use_interactions = bool(cfg.get("observation", "use_interactions", default=False))
         self.sight_range = float(cfg.get("sim", "sight_range", default=0.12))
@@ -229,6 +238,9 @@ class LiveMatchEnv:
         if self.use_interactions:                        # widen by the interaction block (zeros until read)
             self.threat_vec = np.concatenate(
                 [self.threat_vec, np.zeros(interactions.INTERACTION_DIM, np.float32)]).astype(np.float32)
+        if self.use_opp_elixir:                          # ...and the opponent elixir/cycle block
+            self.threat_vec = np.concatenate(
+                [self.threat_vec, np.zeros(opp_elixir.OPP_ELIXIR_DIM, np.float32)]).astype(np.float32)
         # --- STRUCTURAL raster: the board channels the policy actually sees in semantic/hybrid mode ---
         self._sem = semantic.LiveRaster(cfg, db) if self.obs_mode != "rgb" else None
         if self._sem is not None:
@@ -275,8 +287,12 @@ class LiveMatchEnv:
         self._last_threat = self.threat_tracker.update(frame, time.time())
         base = self._last_threat.vector()
         if not self.use_detector:
-            self.threat_vec = base if not self.use_interactions else np.concatenate(
-                [base, np.zeros(interactions.INTERACTION_DIM, np.float32)]).astype(np.float32)
+            parts = [base]
+            if self.use_interactions:
+                parts.append(np.zeros(interactions.INTERACTION_DIM, np.float32))
+            if self.use_opp_elixir:      # no detector -> no deploys observed, but the estimator still
+                parts.append(self._opponent_elixir_block([]))   # integrates regen and reads the cap
+            self.threat_vec = np.concatenate(parts).astype(np.float32)
             return
         dets = self._detect_enemies(frame)                                   # ONE detector pass this frame
         now = time.time()
@@ -296,7 +312,31 @@ class LiveMatchEnv:
                      for d in self._last_dets_all
                      if d.team in ("mine", "enemy") and d.base in self.detector_cards]
             parts.append(interactions.interaction_vector(units, my_t, en_t, self.db))
+        if self.use_opp_elixir:
+            parts.append(self._opponent_elixir_block(dets))
         self.threat_vec = np.concatenate(parts).astype(np.float32)
+
+    _RATE_BY_MULT = {1: 1.0 / 2.8, 2: 1.0 / 1.4, 3: 1.0 / 0.93}   # matches SimEngine.elixir_rate()
+
+    def _opponent_elixir_block(self, enemy_dets) -> np.ndarray:
+        """Advance the opponent-elixir estimator from THIS frame's detections and return its features.
+
+        Regen is integrated over real wall-clock time between reads (the live act cadence is not a
+        fixed tick), at the rate the 2x/3x clock says. Deploys come from presence-differencing the
+        detector -- see opp_elixir.DeployObserver for why that is the only signal available.
+        """
+        now = time.time()
+        dt = (now - self._opp_prev_t) if self._opp_prev_t else 0.0
+        self._opp_prev_t = now
+        rate = self._RATE_BY_MULT.get(int(self.elixir_mult), self._RATE_BY_MULT[1])
+        for base in self._deploy_obs.step(enemy_dets):
+            self.opp_elixir.observe_deploy(base, rate)
+            self.opp_cycle.record_play(base)
+        # `quiet` = an actually EMPTY board, not merely "we detected nothing" -- see the note in
+        # OpponentElixir.regen about why blindness must not be read as idleness.
+        quiet = not list(enemy_dets)
+        self.opp_elixir.regen(min(dt, 5.0), rate, quiet=quiet)   # clamp a stall so a hitch can't fill the bar
+        return opp_elixir.features(self.opp_elixir, self.opp_cycle, self.elixir)
 
     def _tagged_dets(self, frame):
         """ONE team-tagged detector pass per FRAME, memoized. The identity block, the opponent memory,
@@ -361,6 +401,11 @@ class LiveMatchEnv:
                 self._opp_mem.reset()
                 self._team_tracker.reset()
                 self._cycle_tracker.reset()
+                if self.opp_elixir is not None:
+                    self.opp_elixir.reset()
+                    self.opp_cycle.reset()
+                    self._deploy_obs.reset()
+                    self._opp_prev_t = None
                 self._read_hand(frame)
                 self._update_threat(frame)
                 self._last_obs = self._observe(frame)
