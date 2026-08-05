@@ -210,6 +210,14 @@ only non-potential rewards — they are the task. Verify the property itself wit
 **Default off**, and deliberately so: which terms deserve to survive is what `ablate-rewards` answers.
 **Sim only** so far — the live env still uses the classic terms and warns if this is enabled.
 
+- ✅ `divergence` — measures **how far `sim/engine.py` drifts from a real match**. Replays a
+  recorded session's action sequence through the engine from a matched start, steps both in
+  lockstep, and scores the gap (tower-HP trajectories, unit counts, time-to-first-tower, outcome).
+  Then ablates each mechanic and ranks which ones **best explain** the drift — most negative delta
+  first, i.e. switching it off moved the sim *toward* reality
+  (`run.py divergence [--session <path>] [--all-mechanics]`). Needs the board detector: nothing in a
+  recording captures the *opponent's* plays, so they have to be inferred from detections.
+
 ## Recording note
 
 Record **continuously across many matches, including the menu navigation** — you

@@ -1364,6 +1364,59 @@ Newest entries are at the bottom.
 
 
 ------------------------------------------------------------------------------
+2026-08-05  —  SIM-VS-REALITY DIVERGENCE harness (`run.py divergence`)
+------------------------------------------------------------------------------
+- WHY. Everything the policy learns, it learns inside sim/engine.py. If the engine's model of CR is
+  wrong the policy optimises a game that does not exist, and the error is INVISIBLE -- the win-rate
+  curve rises happily against a simulator that is wrong in the same way it always was. Nothing in the
+  repo measured that. This does: take a real recorded match, replay the SAME action sequence through
+  the engine from a matched start, step both in lockstep, score how far apart they end up.
+- WHAT IS RECOVERABLE FROM A RECORDING -- the constraint that shaped the whole design:
+    tower HP / destroyed .. YES (TowerHpTracker digit CNN + TowerTracker)
+    YOUR plays ............ YES exactly (events.jsonl clicks + hand recognition)
+    OPPONENT's plays ...... NO. NOTHING RECORDS THEM. Inferred from the detector as "a new enemy unit
+                            appeared on their half, so a card was played". A trained detector is
+                            therefore REQUIRED, and inference quality upper-bounds the measurement.
+    unit counts ........... detector only, counts not identities
+    outcome ............... YES (scoreboard, cross-checked vs towers felled)
+  Without a detector the harness runs but prints a loud WARNING that the number is not a fidelity
+  measurement (the replay would contain your plays only -> dominated by "the opponent never played").
+- SCORE = weighted composite of four components each normalized ~[0,1]: tower_hp (mean |HP-fraction
+  error| over all six towers -- the backbone, since tower HP integrates nearly every mechanic),
+  units (per-side count error), first_tower (|time-to-first-tower| error / match length), outcome
+  (binary). Missing components are NaN and the composite RENORMALIZES over what was measured rather
+  than scoring a missing metric as a perfect match.
+- ATTRIBUTION by ABLATION: each mechanic is switched off in the engine, the replay re-scored, and the
+  mechanics ranked by how much divergence MOVES. Ablations are mostly spec/engine field mutations
+  (aggro = sight 0, building_pull = building_only False, body_block = collide False, deploy_delay,
+  spell_delay, siege_sight, tower_first_hit); only `pathing` needs a method patch (straight-line
+  movement instead of bridge routing).
+- BUG CAUGHT BY THE DEMO: ranking by |delta| is WRONG and looks right. A load-bearing mechanic
+  (siege_sight in an X-Bow match) has a huge POSITIVE delta because ablating it wrecks the replay, so
+  magnitude-ranking put it at the top of EVERY list and buried the actual cause. "Best explains the
+  drift" is precisely the opposite: the most NEGATIVE delta -- ablating it moved the sim TOWARD
+  reality. Fixed to sort ascending; the legend now separates "candidate explanation" (negative) from
+  "load-bearing, not wrong" (large positive).
+- RESOLUTION CAVEAT, found the hard way: --stride sets the lockstep sampling period (default 1s) and
+  anything shorter is INVISIBLE to the score -- a 0.4s spell-delay error falls entirely between
+  samples. Documented, printed at runtime, and pinned as a test. The separate "was this mechanic even
+  exercised?" check deliberately runs at PHYSICS resolution so a sub-stride mechanic is not
+  mislabelled [NOT EXERCISED].
+- CHARGE IS NOT MODELLED and so cannot be ablated -- sim/engine.py says so in its own docstring
+  ("card-specific quirks (charge / ramp-up) are still out of scope"). Reported as a STRUCTURAL GAP
+  listing the charge cards actually played in the match (Prince, Hog Rider, Ram Rider, Battle Ram,
+  Sparky, Bandit...), rather than fabricating a sensitivity row for a mechanic that does not exist.
+- TESTS (tests/test_divergence.py, 19): the harness is validated WITHOUT a recording by using the
+  engine itself as "reality" -- (1) SELF-CONSISTENCY: engine replayed against itself scores exactly 0;
+  (2) INJECTED-DRIFT ATTRIBUTION: generate reality with ONE mechanic broken, and the ranking must name
+  that mechanic. All four core mechanics (pathing / aggro / building_pull / body_block) are correctly
+  identified as the top candidate. Plus score-component unit tests, the renormalization rule, the
+  sub-stride caveat, and the charge-gap reporting. Full suite 213 passing.
+- NOT VALIDATED HERE: the OBSERVATION half (video -> trajectory). It needs a real session and a
+  trained detector, neither of which is in the repo. Run it on the training machine.
+
+
+------------------------------------------------------------------------------
 Notes / caveats
 ------------------------------------------------------------------------------
 - Reward-shaping changes only take effect after an RL run (`train-rl`) — they
