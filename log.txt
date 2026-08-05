@@ -1417,6 +1417,62 @@ Newest entries are at the bottom.
 
 
 ------------------------------------------------------------------------------
+2026-08-05  —  OPPONENT ELIXIR + CYCLE estimation (the counting a human does, that the policy never could)
+------------------------------------------------------------------------------
+- WHY. A human plays CR by counting the opponent's elixir -- it decides whether to commit the X-Bow or
+  wait. The policy observed its own elixir exactly and theirs not at all, so every WHEN-to-commit
+  decision was made with half the information a player uses.
+- NEW clashrl/opp_elixir.py. e(t) = clamp(e0 + integral(rate) - sum(costs), 0, 10), with e0=5 and rate
+  exactly known (same for both players; elixir_rate() already models 1x/2x/3x). The only unknown is
+  WHICH cards they played -- live that comes from the detector, which misses things -- so it tracks an
+  INTERVAL + confidence, never a point estimate:
+    hi   upper bound under RECALL error (a missed spend can only make the truth lower). NOT sound under
+         PRECISION error: misreading a 3-cost as a 6-cost subtracts too much. Documented as the
+         asymmetry it is -- a hard bound against misses, a soft one against confusions.
+    lo   hi minus a miss allowance = (1/r - 1)*observed_cost  +  blind_spend_frac * regen_since_sync
+    conf 1 - (hi-lo)/10
+- DEPLOY-DELAY CORRECTION, and the ORDER matters. A troop is visible ~1s after the elixir left the bar.
+  Subtracting on detection is right in mid-bar (regen applies to truth and estimate alike) but WRONG at
+  the cap: the clamp eats elixir that was really spent. observe_deploy rewinds the regen, applies the
+  cost there, rolls forward again. BUG FOUND WRITING THE TEST: rewinding a CLAMPED value under-estimates
+  the past -- if the bar has been pinned at 10 for >= the delay they were AT 10 when they paid, so
+  subtracting `back` from 10 invents elixir they never lost. Now gated on _idle_at_cap >= deploy_delay.
+- SELF-CORRECTION AT THE CAP -- and the correction to the correction. The 10-cap is an ABSORBING STATE
+  that erases history, so sustained idle at the cap collapses the interval back to a confident point.
+  BUT the first version keyed that off "no deploy OBSERVED", which is NOT "no deploy HAPPENED": with a
+  whitelist covering a slice of the meta the estimator can observe nothing all match while they play
+  continuously, and reading that silence as idleness snapped the interval confidently to 10 exactly
+  when it was most wrong. The re-sync now requires EVIDENCE of quiet (an empty board), passed in by
+  both envs. Pinned as a test.
+- MEASURED, and it changes how to read the feature: on a sampled sim rollout the opponent's meta deck
+  had 1 of 8 cards on `detector_cards` -- the estimator observed 0 of 33 deploys with precision
+  corruption on. That is why blind_spend_frac defaults to 1.0 (they cannot have spent more than they
+  earned -- a genuine bound, not a tuning guess). Current behaviour: truth inside the interval ~82% of
+  the time at MEAN CONFIDENCE 0.15. So today the value is (a) the LOWER bound (they have at least X),
+  (b) cap detection = a punish window, recoverable with no detections at all, and (c) telling the
+  policy honestly when it does not know. It sharpens for free as the whitelist grows.
+- ENEMY CYCLE. cycle.CycleTracker reads YOUR hand/next off screen; the opponent's hand is never
+  visible, so EnemyCycleTracker bootstraps from an ALL-UNKNOWN queue of -1 slots (cycle_vector already
+  tolerates them) and fills in as cards are seen played, rotating each play to the back like the real
+  queue. Rejects a 9th distinct card as detector noise. Gives wincon soonness once their wincon shows.
+- FEATURES (OPP_ELIXIR_DIM=8) appended to the threat vector: lo, hi, confidence, ELIXIR ADVANTAGE
+  (centred at 0.5), CAN-THEY-AFFORD-WINCON (graded off the interval, not a midpoint coin flip), wincon
+  cycle soonness, at-the-cap, their-deck coverage. threat_dim 46 -> 54 = a FRESH train-sim.
+- SIM PARITY IS THE POINT. SimMatchEnv runs the SAME estimator on deploys pushed through the SAME
+  recall/precision model every other Stage-3 block uses -- unnameable card = missed entirely, per-card
+  recall roll, precision relabel = WRONG COST subtracted. It is never fed engine ground-truth elixir:
+  that would teach the policy to lean on precision it does not have live, and the failure would only
+  surface on the ladder. VERIFIED: the sim estimate diverges from engine truth, and the interval widens.
+- PRIVATE RNG (5cdf867 DomainRand pattern), seed drawn UNCONDITIONALLY so a conditional draw cannot
+  itself desync env.rng. VERIFIED: the 777-seeded eval deck/opponent/tower stream is bit-identical with
+  the feature on and off.
+- TESTS: tests/test_opp_elixir.py, 29 -- arithmetic, deploy-delay-at-cap, cap re-sync + its quiet
+  gating, interval width vs recall, unnameable spawns, graded can-afford, cycle bootstrap/rotation/
+  8-card guard, feature layout, and the sim-parity group (not-ground-truth, upper-bound soundness under
+  recall-only noise, bracketing rate, seed determinism, reproducibility). Suite 242 passing.
+
+
+------------------------------------------------------------------------------
 Notes / caveats
 ------------------------------------------------------------------------------
 - Reward-shaping changes only take effect after an RL run (`train-rl`) — they

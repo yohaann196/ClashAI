@@ -104,6 +104,31 @@ It overlays every anchor on a real frame (one image per card, plus landmarks) an
 against the reward geometry. Checkpoints record their anchor set; `train-rl` and `play` refuse a
 mismatch rather than place cards on the wrong tiles.
 
+### Counting the opponent's elixir (`observation.use_opponent_elixir`)
+
+A human plays by counting the opponent's elixir; the policy never saw it. Elixir is an accumulator with
+known dynamics — `e(t) = clamp(e0 + ∫rate − Σcosts, 0, 10)`, with `e0 = 5` and `rate` exactly known — so
+the only unknown is *which cards they played*. Live that comes from the detector, which misses things,
+so the estimator tracks an **interval `[lo, hi]` plus a confidence scalar**, never a point estimate. It
+**self-corrects at the cap**: 10 elixir is an absorbing state that erases history, so a sustained *empty
+board* collapses the interval back to a confident point.
+
+Eight features reach the threat vector: `lo`, `hi`, confidence, **elixir advantage**,
+**can-they-afford-wincon**, their win-condition's cycle soonness, at-the-cap, and how much of their deck
+has been identified (`EnemyCycleTracker` bootstraps from an all-unknown queue and fills in as cards are
+seen played).
+
+**The sim runs the same estimator on corrupted inputs** — deploys pushed through the detector's measured
+recall and precision, never engine ground truth. Feeding it exact opponent elixir would teach the policy
+to lean on precision it doesn't have live, and the failure would only show up on the ladder.
+
+> **Read the confidence, not just the bounds.** With the current `detector_cards` whitelist covering only
+> a slice of the meta, the interval is usually wide (measured mean confidence ≈ 0.15, truth inside the
+> interval ≈ 82% of the time). Today the value is the *lower* bound, cap detection as a punish window,
+> and the estimator honestly saying when it doesn't know. It sharpens as the whitelist grows.
+
+Flipping this widens `threat_dim` 46 → 54, so it needs a fresh `train-sim`.
+
 ## Setup
 
 ```powershell

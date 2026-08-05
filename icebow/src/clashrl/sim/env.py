@@ -19,6 +19,7 @@ from ..actions import AnchorSpace
 from ..cards import CardDB
 from .. import card_threat
 from .. import interactions
+from .. import opp_elixir
 from .. import semantic
 from .. import shaping
 from ..cycle import cycle_vector
@@ -67,10 +68,15 @@ class SimMatchEnv:
         # Stage-3b gate: the troop-INTERACTION block (who is predicted to be moving at which tower)
         self.use_interactions = bool(cfg.get("observation", "use_interactions", default=False))
         self.sight_range = float(cfg.get("sim", "sight_range", default=0.12))
+        # OPPONENT ELIXIR + CYCLE (clashrl/opp_elixir.py). Fed DETECTOR-CORRUPTED deploys, never engine
+        # ground truth: handing the policy exact opponent elixir in training would teach it to lean on
+        # precision it does not have live, and the failure would only surface on the ladder.
+        self.use_opp_elixir = bool(cfg.get("observation", "use_opponent_elixir", default=False))
         self.threat_dim = (_THREAT_DIM
                            + ((card_threat.IDENTITY_DIM + card_threat.OPP_MEMORY_DIM)
                               if self.use_detector else 0)
-                           + (interactions.INTERACTION_DIM if self.use_interactions else 0))
+                           + (interactions.INTERACTION_DIM if self.use_interactions else 0)
+                           + (opp_elixir.OPP_ELIXIR_DIM if self.use_opp_elixir else 0))
 
         def _base(k):
             return k[:-4] if k.endswith("_evo") else k
@@ -157,6 +163,14 @@ class SimMatchEnv:
         # streams shift and the benchmark stops being comparable. The SEED is drawn unconditionally,
         # even in rgb mode where the raster is never built: drawing it only sometimes would itself
         # desynchronise self.rng between obs modes, which is the exact bug the private rng prevents.
+        # PRIVATE rng for the opponent-elixir detector corruption, drawn UNCONDITIONALLY (even when
+        # the feature is off) so the seeded eval deck stream is bit-identical with it on or off --
+        # the 5cdf867 DomainRand rule, plus the lesson that a CONDITIONAL seed draw is itself a desync.
+        _oe_seed = self.rng.randrange(2 ** 31)
+        self._oe_rng = random.Random(_oe_seed)
+        self.opp_elixir = opp_elixir.OpponentElixir(cfg, self.db) if self.use_opp_elixir else None
+        self.opp_cycle = opp_elixir.EnemyCycleTracker(self.db) if self.use_opp_elixir else None
+        self._last_opp_deploy_t = None
         _sem_seed = self.rng.randrange(2 ** 31)
         self.sem_raster = (semantic.SimRaster(cfg, self.db, random.Random(_sem_seed))
                            if self.obs_mode != "rgb" else None)
@@ -200,6 +214,9 @@ class SimMatchEnv:
         use_detector, append card_threat's identity block for the RECOGNISED (whitelisted) enemies."""
         base = view.threat_vector(self.eng, _THREAT_DIM, team=0)
         if not self.use_detector:
+            if self.use_opp_elixir:
+                return np.concatenate([base, opp_elixir.features(
+                    self.opp_elixir, self.opp_cycle, self.eng.elixir[0])]).astype(np.float32)
             return base
         self._threat_id = card_threat.identity_threat_vector(
             view.apply_detector_noise(view.identity_items(self.eng, 0, self.detector_cards),
@@ -216,7 +233,44 @@ class SimMatchEnv:
             units, mine_t, en_t = view.interaction_state(self.eng, 0, self.detector_cards, self.rng,
                                                          self.det_recall, self.det_recall_by_card)
             parts.append(interactions.interaction_vector(units, mine_t, en_t, self.db))
+        if self.use_opp_elixir:                       # their estimated elixir + cycle (never ground truth)
+            parts.append(opp_elixir.features(self.opp_elixir, self.opp_cycle, self.eng.elixir[0]))
         return np.concatenate(parts).astype(np.float32)
+
+    def _observe_opponent_deploy(self) -> None:
+        """Feed the opponent-elixir estimator a DETECTOR-CORRUPTED view of team 1's last deploy.
+
+        This is the whole point of the exercise. The engine knows exactly what the opponent played; the
+        live policy will not. So the ground-truth deploy is pushed through the SAME recall/precision
+        model every other Stage-3 block uses before the estimator ever sees it:
+
+          * a card outside `detector_cards` is one the detector cannot name at all -> the deploy is
+            MISSED entirely (the estimator never learns that elixir was spent)
+          * per-card RECALL decides whether a nameable deploy is seen
+          * PRECISION can relabel it as a different whitelisted card -> the estimator subtracts the
+            WRONG COST, which is exactly the error mode live
+
+        Draws from `self._oe_rng`, never `self.rng`, so seeded eval deck streams are unaffected.
+        """
+        d = self.eng.last_deploy.get(1)
+        if not d:
+            return
+        spec, _x, _y, t = d
+        if t == self._last_opp_deploy_t:
+            return                                     # already accounted for
+        self._last_opp_deploy_t = t
+        base = getattr(spec, "base", None)
+        rate = self.eng.elixir_rate()
+        if base is None or (self.detector_cards and base not in self.detector_cards):
+            return                                     # unnameable -> a MISS, and the interval widens
+        r = self.det_recall_by_card.get(base, self.det_recall)
+        if r < 1.0 and self._oe_rng.random() > r:
+            return                                     # detector missed this deploy
+        seen = base
+        if self.det_precision < 1.0 and self.detector_cards and self._oe_rng.random() > self.det_precision:
+            seen = self._oe_rng.choice(sorted(self.detector_cards))   # misclassified -> wrong cost
+        self.opp_elixir.observe_deploy(seen, rate)
+        self.opp_cycle.record_play(seen)
 
     def _render(self) -> np.ndarray:
         return self.render_for(self.eng, team=0)
@@ -255,6 +309,10 @@ class SimMatchEnv:
         self._split_lane_counter = bool(opp_cards & self.split_lane_counters)
         if self._matchup in ("cycle", "beatdown") or self._split_lane_counter:
             self._defensive = True
+        if self.opp_elixir is not None:
+            self.opp_elixir.reset()
+            self.opp_cycle.reset()
+        self._last_opp_deploy_t = None
         self._nado_watch = []            # in-flight tornado casts awaiting their delayed execution credit
         self._nado_king_credited = False
         self._reset_vectors()
@@ -537,10 +595,18 @@ class SimMatchEnv:
             reward += self._threat_miss_idle()                 # (1) ignored an ANSWERABLE threat (uncapped penalty)
         # opponent acts, then advance the match by agent_dt in sub-ticks
         self.opponent.act(self.eng)
+        if self.opp_elixir is not None:
+            self._observe_opponent_deploy()           # corrupted by detector recall/precision
         chip0 = chip1 = 0.0
         steps = max(1, int(round(self.agent_dt / self.sub_dt)))
         for _ in range(steps):
+            rate = self.eng.elixir_rate()
             self.eng.advance(self.sub_dt)
+            if self.opp_elixir is not None:
+                # `quiet` must be EVIDENCE of idleness (an empty board), not the absence of
+                # observations -- see OpponentElixir.regen.
+                quiet = not any(u.team == 1 and u.hp > 0 for u in self.eng.units)
+                self.opp_elixir.regen(self.sub_dt, rate, quiet=quiet)
             chip0 += self.eng.chip[0]
             chip1 += self.eng.chip[1]
             if self.eng.done:
