@@ -155,6 +155,30 @@ All tunables in [config/config.yaml](config/config.yaml): `window.region`,
   the **sim-vs-real gap**, not as an absolute — a good policy *should* concentrate its
   placements (`run.py obs-diversity --ckpt data/policy_sim_best.pt`).
 
+- ✅ `ablate-rewards` — measures whether each reward **shaping term actually earns its place**:
+  trains a fresh policy with the term zeroed, scores it on the frozen non-adaptive eval pool,
+  repeats over seeds, and prints a table ranked by `delta = winrate(removed) − winrate(baseline)`.
+  Negative delta = the term helps; positive = it is actively harmful; a CI crossing zero = no
+  measurable effect at that budget. Resumable and shardable — a full sweep is
+  `(terms + 1) × seeds` from-scratch training runs, so start with `--dry-run`
+  (`run.py ablate-rewards --dry-run --matches 4000 --seeds 3`).
+
+### Reward shaping: potential-based mode
+
+Every dense reward term is scored on the **act** (played the right counter, placed the X-Bow well),
+which is the farmable kind — `correctness_cap` exists only to stop the policy grinding them.
+Ng, Harada & Russell (1999) showed that shaping of the form `F = γΦ(s′) − Φ(s)` leaves the **optimal
+policy unchanged**: its discounted sum over any trajectory telescopes to `−Φ(s₀)`, a constant fixed by
+the start state. There is nothing to farm, by construction, so the cap is disabled in this mode.
+
+`rewards.potential_based.enabled` swaps the dense terms for state potentials (`trade`, `chip`,
+`threat`, `wincon`, `cycle`, `leak`), leaving `win`/`loss`/`take_enemy_tower`/`lose_own_tower` as the
+only non-potential rewards — they are the task. Verify the property itself with
+`python tools/potential_invariance.py`.
+
+**Default off**, and deliberately so: which terms deserve to survive is what `ablate-rewards` answers.
+**Sim only** so far — the live env still uses the classic terms and warns if this is enabled.
+
 ## Recording note
 
 Record **continuously across many matches, including the menu navigation** — you

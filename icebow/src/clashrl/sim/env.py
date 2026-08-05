@@ -20,6 +20,7 @@ from ..cards import CardDB
 from .. import card_threat
 from .. import interactions
 from .. import semantic
+from .. import shaping
 from ..cycle import cycle_vector
 from .engine import SimEngine, build_spec
 from .meta_decks import load_meta_decks
@@ -94,6 +95,16 @@ class SimMatchEnv:
         self.w_cycle_waste = r("cycle_waste", -0.4)          # purposeless cheap spam
         self.w_leak = r("leak_penalty", -0.2)                # sitting at elixir capacity, leaking
         self.correctness_cap = r("correctness_cap", 8.0)     # per-match cap on POSITIVE shaping (anti-farm)
+        # POTENTIAL-BASED shaping (Ng et al. 1999; see clashrl/shaping.py). When on, the dense
+        # action-scored terms below are REPLACED by F = gamma*Phi(s') - Phi(s), which is provably
+        # policy-invariant; only the SPARSE outcome terms (win/loss, take/lose tower) stay as ordinary
+        # rewards. The anti-farm cap is then disabled: it is unnecessary (the theorem already forbids
+        # farming) and actively harmful (a path-dependent clamp is not a function of state, so it
+        # would break the invariance it is bolted onto).
+        self.potential = shaping.enabled(cfg)
+        self.shaper = shaping.PotentialShaper(cfg, self) if self.potential else None
+        if self.potential:
+            self.correctness_cap = float("inf")
         # OUTCOME compass -- DEMOTED so correctness dominates (winning is not the objective).
         self.w_win = r("win", 2.0); self.w_loss = r("loss", -2.0)
         self.w_take = r("take_enemy_tower", 1.0); self.w_lose = r("lose_own_tower", -1.0)   # the CROWN jump on a take/loss
@@ -247,6 +258,8 @@ class SimMatchEnv:
         self._nado_king_credited = False
         self._reset_vectors()
         self._update_vectors()
+        if self.shaper is not None:
+            self.shaper.reset()      # latch Phi(s_0) AFTER the first vectors exist (Phi reads them)
         return self._last_obs
 
     def _bonus(self, credit: float) -> float:
@@ -508,16 +521,18 @@ class SimMatchEnv:
                 placed_id = card_id
                 if self._forced_expensive_spend(card_id, ny):
                     spent = 0.0            # forced defensive counter (no cheaper answer available) -> waive its spend
-                reward += self._bonus(self._threat_response(card_id, nx, ny))   # (1) counter to the assessed threat
-                reward += self._bonus(self._wincon_exec(card_id, nx, ny))       # (3) win-condition executed right
-                reward += self._bonus(self._cycle_plan(card_id))                # (4) deliberate cycling
-                if card_id in self.damage_spell_ids and self._spell_no_target(nx, ny, spec):
-                    reward += self.w_spell_waste                                 # (soft) damage spell cast into emptiness
-                if spec.kind == "spell" and getattr(spec, "pulls", False):
-                    self._register_nado(nx, ny, spec)           # tornado: watch the pull -> delayed execution credit
+                if not self.potential:
+                    # CLASSIC form: bonuses paid for the ACT. Farmable, hence the correctness cap.
+                    reward += self._bonus(self._threat_response(card_id, nx, ny))   # (1) counter to the assessed threat
+                    reward += self._bonus(self._wincon_exec(card_id, nx, ny))       # (3) win-condition executed right
+                    reward += self._bonus(self._cycle_plan(card_id))                # (4) deliberate cycling
+                    if card_id in self.damage_spell_ids and self._spell_no_target(nx, ny, spec):
+                        reward += self.w_spell_waste                             # (soft) damage spell cast into emptiness
+                    if spec.kind == "spell" and getattr(spec, "pulls", False):
+                        self._register_nado(nx, ny, spec)       # tornado: watch the pull -> delayed execution credit
                 idx = self.cycle.index(card_id)                                 # cycle the played card to the back
                 self.cycle.append(self.cycle.pop(idx))
-        else:
+        elif not self.potential:
             reward += self._threat_miss_idle()                 # (1) ignored an ANSWERABLE threat (uncapped penalty)
         # opponent acts, then advance the match by agent_dt in sub-ticks
         self.opponent.act(self.eng)
@@ -534,11 +549,12 @@ class SimMatchEnv:
         evalue = self._enemy_value()
         edelta = self._prev_evalue - evalue
         self._prev_evalue = evalue
-        reward += self._trade_reward(edelta, spent)
-        reward += self._bonus(self._nado_shaping())    # delayed tornado-execution credit (clump/combo/king/retarget)
-        # (5) leak: sitting at capacity with nothing played this step wastes elixir.
-        if placed_id < 0 and self.eng.elixir[0] >= 9.99:
-            reward += self.w_leak
+        if not self.potential:
+            reward += self._trade_reward(edelta, spent)
+            reward += self._bonus(self._nado_shaping())  # delayed tornado-execution credit (clump/combo/king/retarget)
+            # (5) leak: sitting at capacity with nothing played this step wastes elixir.
+            if placed_id < 0 and self.eng.elixir[0] >= 9.99:
+                reward += self.w_leak
         # OFFENSIVE -> DEFENSIVE phase (icebow): once you've TAKEN a tower (defend the lead), OR double elixir
         # arrives and the X-Bow never broke through (cumulative enemy chip < xbow_success_frac of a tower),
         # flip to defence -- rocket-cycle becomes the tower damage; the X-Bow reward moves to back-centre.
@@ -552,12 +568,13 @@ class SimMatchEnv:
         # --- OUTCOME compass (DEMOTED: winning is not the objective, just a faint direction) ---
         # CONVEX tower-chip proxy: partial chip is worth sub-proportionally little; the CROWN below is the
         # big JUMP when a tower is actually destroyed (a tower at 1-2 HP still works -> worth far less).
-        ep = self._chip_progress(self.eng.towers[1])
-        reward += (ep - self._prev_chip_prog) * self.tower_chip_scale
-        self._prev_chip_prog = ep
-        mp = self._chip_progress(self.eng.towers[0])
-        reward -= (mp - self._prev_chip_prog_def) * self.tower_chip_scale
-        self._prev_chip_prog_def = mp
+        if not self.potential:                # (potential mode folds this into shaping.Phi_chip)
+            ep = self._chip_progress(self.eng.towers[1])
+            reward += (ep - self._prev_chip_prog) * self.tower_chip_scale
+            self._prev_chip_prog = ep
+            mp = self._chip_progress(self.eng.towers[0])
+            reward -= (mp - self._prev_chip_prog_def) * self.tower_chip_scale
+            self._prev_chip_prog_def = mp
         if my_c > self._prev_my_crowns:
             reward += self.w_take * (my_c - self._prev_my_crowns)
         if op_c > self._prev_op_crowns:
@@ -568,5 +585,13 @@ class SimMatchEnv:
         if done:
             reward += self.w_win if outcome == "win" else self.w_loss if outcome == "loss" else 0.0
         self._update_vectors()
+        if self.shaper is not None:
+            # F = gamma*Phi(s') - Phi(s), added AFTER _update_vectors so Phi reads the post-step state
+            # (the threat/cycle potentials depend on the refreshed identity block + hand). On a
+            # terminal step Phi(s') is taken as 0, which is what makes the discounted sum of F over an
+            # episode telescope to exactly -Phi(s_0) regardless of the actions taken.
+            shaping_f = self.shaper.step(done)
+            reward += shaping_f
+            self._shaping_last = shaping_f
         info = {"outcome": outcome, "crowns": (my_c, op_c), "defensive": self._defensive}
         return self._last_obs, float(reward), done, info

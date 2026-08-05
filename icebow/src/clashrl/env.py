@@ -177,6 +177,17 @@ class LiveMatchEnv:
         self.w_cycle_waste = rw("cycle_waste", -0.4)          # purposeless cheap spam
         self.w_leak = rw("leak_penalty", -0.2)                # (5) sitting at elixir capacity, leaking
         self.correctness_cap = rw("correctness_cap", 20.0)    # per-match cap on POSITIVE shaping (anti-farm)
+        # POTENTIAL-BASED shaping is implemented for the SIM ONLY so far (clashrl/shaping.py). Its
+        # potentials read engine ground truth -- exact enemy troop value, per-unit HP -- and the live
+        # twin needs perception-side equivalents (enemy MASS from pixels, TowerHpTracker for the chip
+        # potential) before it can match. Until then, turning it on trains a sim prior under one reward
+        # and fine-tunes it live under a different one, so say so loudly rather than diverge silently.
+        from . import shaping as _shaping
+        if _shaping.enabled(cfg):
+            print("[env] WARNING: rewards.potential_based.enabled is ON, but the LIVE env still uses the "
+                  "CLASSIC action-scored terms -- only the sim has been converted. train-rl would "
+                  "fine-tune against a DIFFERENT reward than train-sim optimised. Port the potentials "
+                  "to live perception first, or keep potential_based off for live fine-tuning.")
         self.w_take = rw("take_enemy_tower", 1.0); self.w_lose = rw("lose_own_tower", -1.0)   # the CROWN jump on a take/loss
         self.tower_chip_scale = rw("tower_chip_scale", 0.3)   # convex chip POOL per tower (small; the crown is the jump)
         self.chip_power = float(cfg.get("env", "tower_chip_power", default=2.0))   # >1 -> partial chip sub-proportional
