@@ -343,6 +343,35 @@ rewards:
   tower_chip_scale: 0.3    # CONVEX chip POOL per tower (with env.tower_chip_power): PARTIAL chip is worth sub-proportionally
                            # little, so the reward JUMPS on the crown (take), not gradually with damage. Total chip << the crown.
   hp_scale: 0.5            # (no longer scales the reward -- tower_hp still reads it; the convex chip proxy replaced its linear return)
+  # ============================================================================================
+  # POTENTIAL-BASED shaping (Ng, Harada & Russell 1999) -- see clashrl/shaping.py.
+  # Every dense term above is scored on the ACT (played the right counter, placed the X-Bow well),
+  # which is the farmable kind -- correctness_cap exists only to stop the policy grinding them.
+  # Ng et al. proved that shaping of the form F = gamma*Phi(s') - Phi(s) leaves the OPTIMAL POLICY
+  # UNCHANGED: its discounted sum over any trajectory telescopes to -Phi(s_0), a constant fixed by
+  # the start state. There is nothing to farm, by construction, so correctness_cap is disabled when
+  # this is on (a path-dependent clamp is not a function of state and would break the invariance).
+  # The dense terms are replaced by these state potentials, inheriting the SAME weights above so
+  # ablation numbers carry over:
+  #   trade   (my_elixir - enemy_remaining_value)/value_norm   <- elixir_trade, gamma-fixed + UNCLIPPED
+  #   chip    chip_progress(theirs) - chip_progress(mine)      <- tower_chip_scale, gamma-fixed
+  #   threat  -(severity of pressure you hold no answer to)    <- threat_response + threat_miss
+  #   wincon  +(win condition established for the phase)       <- wincon_exec + wincon_misplace
+  #   cycle   +(you hold an answer to the current threat)      <- cycle_plan + cycle_waste
+  #   leak    -(elixir sitting at the cap)                     <- leak_penalty
+  # DROPPED as subsumed: spell_waste (a whiff already shows up as elixir spent for nothing in
+  # `trade`) and nado_clump/combo/retarget (measured from a post-cast watch list = functions of
+  # HISTORY, not state, so no Phi can express them; their effects appear in `trade` + `threat`).
+  # NOT subsumed: nado_king_activate (waking your own king is invisible to every potential above) --
+  # if the ablation shows it earns its place it has to stay a non-potential term, declared as such.
+  # The SPARSE win/loss/take_enemy_tower/lose_own_tower terms are the real task reward and are
+  # deliberately left alone -- they are what the shaping is shaping toward.
+  # DEFAULT OFF: which terms survive is an empirical question. Run `run.py ablate-rewards` first,
+  # delete the terms that do not earn their place, then turn the survivors on here.
+  # Verify the invariance itself with: python tools/potential_invariance.py
+  potential_based:
+    enabled: false
+    components: [trade, chip, threat, wincon, cycle, leak]
 
 # --- Automatic win/loss detection (results scoreboard) -------------------
 # Reads the 2v2 end screen: YOUR team (blue) sits on the BOTTOM, the enemy
