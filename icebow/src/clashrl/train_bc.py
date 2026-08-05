@@ -81,23 +81,9 @@ def train_bc(cfg, init: str | None = None, iterations: int = 1) -> None:
     if deck is None:
         deck = [f"card{i}" for i in range(n_cards)]
 
-    device = cfg.get("train", "device", default="cuda")
-    if device == "cuda":
-        if not torch.cuda.is_available():
-            print("[train-bc] CUDA not available; using CPU. "
-                  "Install the CUDA build of torch to use your GPU.")
-            device = "cpu"
-        else:
-            try:
-                _ = (torch.zeros(1, device="cuda") + 1).item()   # probe for a runnable kernel
-            except Exception as exc:  # noqa: BLE001
-                print(f"[train-bc] GPU detected ({torch.cuda.get_device_name(0)}) but this torch "
-                      f"build can't run kernels on it:\n    {exc}\n"
-                      "  Newer GPUs need a matching build — RTX 50-series (Blackwell) = CUDA 12.8:\n"
-                      "    pip install torch --index-url https://download.pytorch.org/whl/cu128\n"
-                      "  Falling back to CPU for now.")
-                device = "cpu"
-    gpu = f" ({torch.cuda.get_device_name(0)})" if device == "cuda" else ""
+    from .device import describe, pick_device
+    device = pick_device(cfg, "train-bc")     # shared cuda / mps / auto resolution
+    gpu = describe(device)
     print(f"[train-bc] {len(obs)} samples from {n_files} session(s); {n_cards} deck cards; "
           f"device={device}{gpu}")
     if len(obs) < 200:

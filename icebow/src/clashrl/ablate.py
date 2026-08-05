@@ -235,6 +235,8 @@ def _run_one(cfg, name: str, overrides: Dict[str, float], seed: int, matches: in
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            torch.mps.empty_cache()          # same leak, Apple silicon
     except Exception:  # noqa: BLE001
         pass
     return wr

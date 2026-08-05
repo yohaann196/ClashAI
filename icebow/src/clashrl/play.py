@@ -29,19 +29,8 @@ from .vision import Vision
 
 
 def _pick_device(cfg):
-    import torch
-    dev = cfg.get("train", "device", default="cuda")
-    if dev != "cuda":
-        return dev
-    if not torch.cuda.is_available():
-        return "cpu"
-    try:
-        _ = (torch.zeros(1, device="cuda") + 1).item()
-        return "cuda"
-    except Exception:  # noqa: BLE001
-        print("[play] GPU present but this torch build can't run on it; using CPU "
-              "(install the cu128 build for your RTX 50-series GPU).")
-        return "cpu"
+    from .device import pick_device
+    return pick_device(cfg, "play")
 
 
 class InMatchGrace:
@@ -155,7 +144,7 @@ def play(cfg) -> None:
     print(f"[play] policy {ckpt_path.name} loaded ({'RL gate ON' if gate is not None else 'BC, no gate'}).")
 
     capture = WindowCapture(cfg.get("window", "title_contains", default=None),
-                            cfg.get("window", "region", default=None))
+                            cfg.get("window", "region", default=None), cfg=cfg)
     if capture.region is None:
         print("[play] no capture region; set window.region in config.yaml.")
         return

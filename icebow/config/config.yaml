@@ -1,3 +1,40 @@
+# --- PLATFORM ---------------------------------------------------------------------------------
+# WHERE the game is and HOW to tap it (src/clashrl/backends.py), plus every spatial constant that
+# depends on the render's shape. A Google Play Games window is ~9:16 (0.566); an iPhone through macOS
+# Mirroring is ~9:19.5 (0.46), and Clash Royale lays its UI out differently at that shape -- so
+# window.region, the tower anchors, action.arena_box, the hand slots and the template folder all
+# genuinely differ per host. The block below is DEEP-MERGED over the base config at load, so both
+# calibrations live side by side and switching hosts is one line instead of overwriting (and losing)
+# the other machine's numbers. Every cfg.get() call site is unchanged -- it just sees the right value.
+#   auto = Darwin -> macos_mirror, otherwise windows_gpg
+platform: auto
+
+platforms:
+  windows_gpg:               # Clash Royale in Google Play Games on Windows (the original setup)
+    window:
+      title_contains: "Clash Royale"
+      region: null           # 4 physical px [left, top, width, height], or null to auto-detect
+    templates:
+      root: "templates"
+
+  macos_mirror:              # Clash Royale on a real iPhone, via macOS iPhone Mirroring
+    window:
+      title_contains: "iPhone Mirroring"
+      region: null           # set this once you have calibrated with `run.py diag`
+    templates:
+      root: "templates/macos_mirror"   # the iPhone UI is a DIFFERENT rendering -- state/card templates
+                                       # cut from a GPG capture will not match it; rebuild them here
+                                       # with `run.py hand-templates` on a macOS recording
+    mirror:
+      app_name: "iPhone Mirroring"     # the macOS process whose window 1 is the phone screen
+      aspect_range: [0.40, 0.62]       # sanity check against grabbing the wrong window, not a calibration
+      click_hold_s: 0.05               # the mirroring link drops zero-duration clicks
+      raise_window: true               # a click into an unfocused mirror window only focuses it
+    # NOTE: the anchors below are NOT calibrated for the iPhone render yet -- they are inherited from
+    # the GPG values by the merge. Calibrate with `run.py diag` and `run.py verify --anchors/--towers`,
+    # then paste the results here as `env:` / `action:` / `hand:` overrides. Until then a macOS capture
+    # will grab the right window but read the wrong boxes.
+
 # =====================================================================
 # Learning ClashBot ("real") configuration.
 # Play + capture happen on PC via Google Play Games, so the agent trains on
@@ -6,8 +43,13 @@
 # =====================================================================
 
 window:
+  # BASE values; the active `platforms.<name>` block overrides these at load. Do NOT write [null] for
+  # region -- that is a 1-item list and errors.
   title_contains: "Clash Royale"
-  region: null   # 4 physical px [left, top, width, height] of the game render, or null to auto-detect the window by title (do NOT write [null] -- that is a 1-item list and errors)
+  region: null   # 4 physical px [left, top, width, height] of the game render, or null to auto-detect
+
+templates:
+  root: "templates"        # folder holding the state/button PNGs (per-platform: the iPhone UI differs)
 
 capture:
   work_width: 480                # frames scaled to this width for vision
@@ -416,7 +458,13 @@ outcome:
 
 # --- DQN / training hyperparameters (RL fine-tune) -----------------------
 train:
-  device: "cuda"                 # "cuda" (GPU) or "cpu"
+  device: auto                   # auto | cuda | mps | cpu.  auto = prefer CUDA, then MPS (Apple
+                                 # silicon Metal), then CPU. Every candidate is PROBED with a real op
+                                 # before being accepted -- `is_available()` can be True on a build
+                                 # that then throws on the first kernel. An explicit choice that is
+                                 # unusable says why rather than silently downgrading.
+                                 # MPS note: Metal lacks some ops and torch raises rather than falling
+                                 # back; PYTORCH_ENABLE_MPS_FALLBACK=1 routes those to CPU.
   gamma: 0.99
   n_step: 3                      # N-STEP returns (sim trainer): each transition's target carries the next N real rewards
                                  # + a bootstrap N states ahead -> consequences (overspend -> counter-push -> tower damage)

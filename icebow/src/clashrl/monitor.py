@@ -96,7 +96,7 @@ class DiscordMonitor:
 
     def _run(self) -> None:
         cap = WindowCapture(self.cfg.get("window", "title_contains", default=None),
-                            self.cfg.get("window", "region", default=None))
+                            self.cfg.get("window", "region", default=None), cfg=self.cfg)
         started = time.time()
         self._send(cap, "monitor started")               # immediate screenshot confirms it works
         while not self._stop.wait(self.interval):

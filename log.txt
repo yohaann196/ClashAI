@@ -1473,6 +1473,65 @@ Newest entries are at the bottom.
 
 
 ------------------------------------------------------------------------------
+2026-08-05  —  macOS support: MPS/auto device selection + a platform Backend seam (GPG / iPhone Mirroring)
+------------------------------------------------------------------------------
+- TWO changes, both because the project was written for exactly one machine.
+- (1) DEVICE. `_pick_device` existed in THREE near-copies (train_rl, train_bc inline, play), all
+  cuda-or-cpu, so a Mac ran the entire pipeline on CPU and never said an Apple-silicon GPU was idle.
+  NEW clashrl/device.py is the single implementation: auto | cuda | mps | cpu, default `auto`
+  (prefer CUDA, then MPS, then CPU). EVERY candidate is PROBED with a real tensor op, not just
+  queried -- `is_available()` returns True on builds that then throw on the first kernel (an RTX
+  50-series card with a pre-Blackwell wheel; MPS with an old torch). An explicit request that cannot
+  be honoured prints WHY instead of silently downgrading. MPS caveat surfaced in the message: Metal
+  lacks some ops and torch RAISES rather than falling back -- PYTORCH_ENABLE_MPS_FALLBACK=1 routes
+  those to CPU. ablate.py's inter-run cache clear now also handles torch.mps.empty_cache().
+  VERIFIED on this Mac: `auto` -> mps.
+- (2) BACKENDS. capture.py + controller.py hard-coded Windows + Google Play Games: pygetwindow
+  enumeration, a Win32 GetClientRect, a content trim tuned to GPG's custom title bar and left icon
+  rail, a 9:16 aspect check, and an instant pyautogui click. NEW clashrl/backends.py extracts a
+  Backend protocol answering only the OS-specific questions -- find_window() / render_area() / tap().
+  GpgBackend is the existing code moved unchanged; MirrorBackend is new (macOS iPhone Mirroring).
+  WindowCapture keeps the mss grab + normalized<->screen arithmetic, Controller keeps the
+  select-then-place sequencing; both are now platform-agnostic. The content trim is shared with a
+  `trim_left` flag, because GPG has a gray icon rail down the left edge and iPhone Mirroring does not
+  -- running GPG's trim there would eat real arena pixels every frame.
+- PLATFORM NAMESPACING. Every spatial constant (window.region, env.my_towers/enemy_towers,
+  action.arena_box, hand slots, templates) is calibrated against ONE render at ONE aspect ratio: GPG
+  is ~9:16 (0.566), an iPhone is ~9:19.5 (0.46) and CR lays its UI out differently at that shape. So
+  config gains `platform: auto` + a `platforms:` block that is DEEP-MERGED over the base at load, and
+  `platform` is pinned to the resolved name. Deep, not top-level: a platform block is a DIFF, so
+  overriding window.region does not delete window.title_contains. The merge means EVERY existing
+  cfg.get() call site is untouched and simply sees the right value -- rather than ~20 sites each
+  learning about platforms. Both calibrations now live side by side instead of one overwriting the
+  other (re-deriving them means re-running the calibration tools).
+- BUG CAUGHT ON REAL HARDWARE, and it is the important one. AppleScript reports POINTS while mss grabs
+  PIXELS; on a Retina Mac those differ by 2x, and getting it wrong does not fail loudly -- it captures
+  a QUARTER of the window and lands every tap at HALF the intended coordinate. My first version asked
+  Finder for the desktop bounds over AppleScript to derive the ratio. On this machine that call HUNG
+  (it needs Automation permission for Finder) and the except-branch silently returned 1.0: a wrong
+  answer that looks like a right one. Now read from Quartz's display mode (pixel width / point width)
+  -- no permissions, no new dependency, since pyobjc-framework-Quartz is already a pyautogui
+  requirement on macOS -- and an UNMEASURABLE scale WARNS loudly instead of assuming. VERIFIED: 2.0 on
+  this 3456x2234 Retina display, and the warning path fires when Quartz is absent.
+- Other real fixes found on the way: pyautogui is now imported LAZILY (module-scope import made
+  clashrl.controller unimportable on a headless box -- CI, a remote shell, a train-sim-only machine);
+  Vision WARNS loudly when a platform's templates folder is empty, because with no templates every
+  screen reads UNKNOWN and the bot silently never acts, which is exactly what a fresh platform hits.
+- STATUS, stated plainly: GpgBackend is the code that has been running all along. MirrorBackend has
+  NOT been run against a real iPhone Mirroring window -- the osascript window lookup and the render
+  trim are first-pass and want checking with `run.py diag` before you trust a capture. The macOS
+  anchors are inherited GPG values and are NOT calibrated for the iPhone render; capture will find the
+  right window and read the wrong boxes until they are.
+- TESTS: tests/test_platform.py, 36 -- device selection (including the lies-about-availability probe
+  and every fallback message), platform resolution (deep merge, side-by-side calibrations, unknown
+  platform, auto), backend selection + protocol conformance, the shared content trim (including that
+  trim_left is NOT applied on the mirror path), capture arithmetic (render lock, retry, explicit-region
+  override, malformed region, coordinate round-trip), controller sequencing, and the Retina-scale
+  regression. The live-window test is explicitly SKIPPED with its reason rather than faked with mocks
+  that would only assert my own assumptions back. Suite 276 passing, 1 skipped.
+
+
+------------------------------------------------------------------------------
 Notes / caveats
 ------------------------------------------------------------------------------
 - Reward-shaping changes only take effect after an RL run (`train-rl`) — they

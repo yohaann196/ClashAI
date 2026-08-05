@@ -26,12 +26,22 @@ class Vision:
         self.cfg = cfg
         self.arena_size = cfg.get("observation", "arena_size", default=[64, 96])
         self.work_width = int(cfg.get("capture", "work_width", default=480))
-        self.templates_dir = cfg.path("templates")
+        # per-PLATFORM: the iPhone render is a different UI, so its state/button PNGs live
+        # in their own folder (see config `templates.root`).
+        self.templates_dir = cfg.path(cfg.get("templates", "root", default="templates"))
         self._templates: dict = {}
         for p in glob.glob(str(self.templates_dir / "*.png")):
             img = cv2.imread(p, cv2.IMREAD_COLOR)
             if img is not None:
                 self._templates[os.path.basename(p)] = img
+        if not self._templates:
+            # Silence here is the worst outcome: with no templates EVERY state read returns UNKNOWN,
+            # so the bot simply never acts and looks hung. That is exactly what a fresh platform hits,
+            # since state PNGs cut from one render do not match another.
+            print(f"[vision] NO state templates found in {self.templates_dir} -- every screen will read "
+                  f"UNKNOWN and the bot will not navigate or play. Templates are per-platform "
+                  f"(config `templates.root`, currently platform={cfg.get('platform', default='?')}): "
+                  f"cut them from a recording on THIS setup, or point templates.root at an existing set.")
 
         # --- hand-card recognition (identity-based actions) ---------------
         self.hand_slots = cfg.get("hand", "slots", default=[])

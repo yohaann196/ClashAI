@@ -27,19 +27,10 @@ import numpy as np
 
 
 def _pick_device(cfg):
-    import torch
-    dev = cfg.get("train", "device", default="cuda")
-    if dev != "cuda":
-        return dev
-    if not torch.cuda.is_available():
-        return "cpu"
-    try:
-        _ = (torch.zeros(1, device="cuda") + 1).item()
-        return "cuda"
-    except Exception:  # noqa: BLE001
-        print("[train-rl] GPU present but this torch build can't run on it; using CPU "
-              "(install the cu128 build for your RTX 50-series GPU).")
-        return "cpu"
+    """Kept as the shared entry point several modules already import; the logic lives in
+    clashrl.device so cuda / mps / auto are resolved identically everywhere."""
+    from .device import pick_device
+    return pick_device(cfg, "train-rl")
 
 
 def _build_net(cfg, device, n_cards, n_anchors, threat_dim=14):

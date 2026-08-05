@@ -47,7 +47,7 @@ class LiveMatchEnv:
     def __init__(self, cfg):
         self.cfg = cfg
         self.capture = WindowCapture(cfg.get("window", "title_contains", default=None),
-                                     cfg.get("window", "region", default=None))
+                                     cfg.get("window", "region", default=None), cfg=cfg)
         self.vision = Vision(cfg)
         self.actions = AnchorSpace(cfg)
         self.controller = Controller(self.capture, cfg)

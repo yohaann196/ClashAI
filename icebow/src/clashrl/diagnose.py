@@ -17,7 +17,7 @@ from .vision import Vision
 
 def diagnose(cfg) -> None:
     capture = WindowCapture(cfg.get("window", "title_contains", default=None),
-                            cfg.get("window", "region", default=None))
+                            cfg.get("window", "region", default=None), cfg=cfg)
     if capture.region is None:
         print("[diag] no capture region; set window.region in config.yaml.")
         return

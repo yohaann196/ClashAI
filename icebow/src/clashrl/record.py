@@ -40,6 +40,7 @@ def record(cfg) -> None:
     capture = WindowCapture(
         cfg.get("window", "title_contains", default=None),
         cfg.get("window", "region", default=None),
+        cfg=cfg,
     )
     region = capture.region
     if region is None:
