@@ -159,16 +159,14 @@ def benchmark(cfg, ckpt_path: Path, matches: int = 48, envs: int = 4) -> Optiona
         e.domain_rand.resample()
         e.opponent_provider = None           # frozen scripted meta bots, NON-adaptive
     e0 = pool[0]
-    net = _build_net(cfg, device, e0.n_cards, e0.n_cells, e0.threat_dim)
+    net = _build_net(cfg, device, e0.n_cards, e0.n_anchors, e0.threat_dim)
     ck = torch.load(ckpt_path, map_location="cpu")
     net.policy.load_state_dict(ck["model"])
     if "gate" in ck:
         net.gate.load_state_dict(ck["gate"])
     net.eval()
 
-    anywhere = set(e0.anywhere_ids)
-    yourhalf = torch.tensor(e0.actions.deployable_mask(False), dtype=torch.bool, device=device)
-    allcells = torch.ones(e0.n_cells, dtype=torch.bool, device=device)
+    anchor_mask = torch.tensor(e0.actions.mask_table(), dtype=torch.bool, device=device)
     costs = torch.tensor([float(s.elixir) for s in e0.specs], dtype=torch.float32, device=device)
 
     def to_t(o):
@@ -195,7 +193,7 @@ def benchmark(cfg, ckpt_path: Path, matches: int = 48, envs: int = 4) -> Optiona
                 act = (0, 0, 0)
             else:
                 ci = int(cq_i.argmax())
-                ceq_i = ceq[i].masked_fill(~(allcells if ci in anywhere else yourhalf), float("-inf"))
+                ceq_i = ceq[i].masked_fill(~anchor_mask[ci], float("-inf"))
                 act = ((0, 0, 0) if gq[i, 0] >= gq[i, 1] + cq_i.max() + ceq_i.max()
                        else (1, ci, int(ceq_i.argmax())))
             nobs, _r, done, info = e.step(act)

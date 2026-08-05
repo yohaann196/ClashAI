@@ -42,7 +42,7 @@ def _pick_device(cfg):
         return "cpu"
 
 
-def _build_net(cfg, device, n_cards, n_cells, threat_dim=14):
+def _build_net(cfg, device, n_cards, n_anchors, threat_dim=14):
     import torch.nn as nn
     from . import semantic
     from .model import PolicyNet
@@ -52,7 +52,7 @@ def _build_net(cfg, device, n_cards, n_cells, threat_dim=14):
     class DQN(nn.Module):
         def __init__(self):
             super().__init__()
-            self.policy = PolicyNet(in_ch, n_cards, n_cells, threat_dim=threat_dim)
+            self.policy = PolicyNet(in_ch, n_cards, n_anchors, threat_dim=threat_dim)
             self.gate = nn.Linear(self.policy.embed_dim, 2)  # [wait, play]
 
         def forward(self, x, hand, nxt=None, elx=None, thr=None):
@@ -96,8 +96,8 @@ def train_rl(cfg, init: str | None = None) -> None:
 
     device = _pick_device(cfg)
     ckpt = torch.load(init_path, map_location="cpu")
-    gw, gh = int(ckpt["grid"][0]), int(ckpt["grid"][1])
-    n_cards, n_cells = int(ckpt["n_cards"]), int(ckpt["n_cells"])
+    n_cards = int(ckpt["n_cards"])
+    n_anchors = int(ckpt.get("n_anchors", 0))
     threat_dim = int(ckpt.get("threat_dim", 14))
     deck = ckpt.get("deck")
 
@@ -127,7 +127,33 @@ def train_rl(cfg, init: str | None = None) -> None:
         print("[train-rl] or restore the old deck in config/cards.yaml to keep using this checkpoint.")
         return
 
-    # HARD GUARD 2: the OBSERVATION LAYOUT must match too. The warm-start checkpoint's conv trunk was
+    # HARD GUARD 2: the ACTION SPACE must match. A policy's placement head is indexed by the card's
+    # ANCHOR LIST, so under a different anchor set index 2 silently means a different tile -- the net
+    # would load cleanly and then place everything wrong. Same fail-fast pattern as the 377b5b7 deck
+    # guard: print both sides and the actionable path rather than let it run.
+    from .actions import AnchorSpace, signature_diff, signatures_match
+    _aspace = AnchorSpace(cfg, _db)
+    _cur_sig = _aspace.signature()
+    _ck_sig = ckpt.get("action_space")
+    if not signatures_match(_ck_sig, _cur_sig):
+        print(f"[train-rl] checkpoint/ACTION-SPACE MISMATCH -- {init_path.name} cannot be used:")
+        for line in signature_diff(_ck_sig, _cur_sig):
+            print(f"[train-rl]   {line}")
+        print(f"[train-rl] current: {_cur_sig['n_cards']} cards x up to {_cur_sig['n_anchors']} anchors "
+              f"(hash {_cur_sig['hash']})")
+        print("[train-rl] the placement head is indexed by each card's anchor list, so a policy trained")
+        print("[train-rl] on a different one would place cards on the wrong tiles. Either restore the")
+        print("[train-rl] old anchors in config/cards.yaml, or train a fresh sim prior for these:")
+        print("[train-rl]   run.py train-sim --matches 200000 --envs 32")
+        print("[train-rl]   run.py train-rl --init data/policy_sim_best.pt")
+        print("[train-rl] (check the anchors land on the intended tiles first: run.py verify --anchors)")
+        return
+    if n_anchors != _cur_sig["n_anchors"]:
+        print(f"[train-rl] checkpoint placement head is {n_anchors} wide, config needs "
+              f"{_cur_sig['n_anchors']} -- train a fresh sim prior.")
+        return
+
+    # HARD GUARD 3: the OBSERVATION LAYOUT must match too. The warm-start checkpoint's conv trunk was
     # shaped for a specific channel stack (RGB pixels / the semantic raster / both) -- loading it under a
     # different obs_mode is either a torch shape error or, in hybrid, a net reading the wrong planes.
     from . import semantic
@@ -149,27 +175,22 @@ def train_rl(cfg, init: str | None = None) -> None:
     else:
         card_elixir = [0.0] * n_cards
     afford_costs = torch.tensor(card_elixir, dtype=torch.float32, device=device)  # [n_cards]
-    # ANYWHERE cards (rocket / miner) may target any cell; every other card can only deploy on YOUR
-    # half. Mask the cell head to DEPLOYABLE cells before the argmax so the policy never selects an
-    # enemy-half cell that would just clamp / no-op -- the 'impossible coordinate' the model kept
-    # trying (which also made it look inactive). Applied at action selection AND in the DDQN target.
-    from .actions import ActionSpace
-    _acts = ActionSpace(cfg)
-    anywhere_ids = {i for i, k in enumerate(deck) if _base_key(k) in ("rocket", "miner")} if deck else set()
-    yourhalf_mask = torch.tensor(_acts.deployable_mask(False), dtype=torch.bool, device=device)  # [n_cells]
-    allcells_mask = torch.ones(n_cells, dtype=torch.bool, device=device)
-    yourhalf_cells = [c for c in range(n_cells) if bool(yourhalf_mask[c])]
-    anywhere_ids_t = torch.tensor(sorted(anywhere_ids), dtype=torch.long, device=device)
+    # PER-CARD ANCHOR MASK [n_cards, n_anchors]: the placement head is as wide as the WIDEST card's
+    # anchor list, so it is masked to the anchors the chosen card actually has. With named anchors
+    # there is no such thing as an illegal placement -- the old your-half/anywhere deployable mask is
+    # gone with the grid. Applied at action selection AND in the DDQN target.
+    anchor_mask = torch.tensor(_aspace.mask_table(), dtype=torch.bool, device=device)
+    anchor_counts = [_aspace.count(c) for c in range(n_cards)]
 
-    net = _build_net(cfg, device, n_cards, n_cells, threat_dim)
+    net = _build_net(cfg, device, n_cards, n_anchors, threat_dim)
     net.policy.load_state_dict(ckpt["model"])
     if "gate" in ckpt:
         net.gate.load_state_dict(ckpt["gate"])
-    target = _build_net(cfg, device, n_cards, n_cells, threat_dim)
+    target = _build_net(cfg, device, n_cards, n_anchors, threat_dim)
     target.load_state_dict(net.state_dict())
     target.eval()
     print(f"[train-rl] initialised from {init_path.name} on {device} "
-          f"(cards={n_cards}, cells={n_cells})")
+          f"(cards={n_cards}, anchors<={n_anchors})")
 
     gamma = float(cfg.get("train", "gamma", default=0.99))
     lr = float(cfg.get("train", "lr", default=1e-4))
@@ -286,7 +307,7 @@ def train_rl(cfg, init: str | None = None) -> None:
             if elixir < min_play_elixir or random.random() < wait_prob:
                 return (0, 0, 0)
             c = random.choice(playable)
-            cells = list(range(n_cells)) if c in anywhere_ids else (yourhalf_cells or list(range(n_cells)))
+            cells = list(range(max(1, anchor_counts[c])))
             return (1, c, random.choice(cells))
         net.eval()
         hv = hand_to_tensor(hand_vec)
@@ -299,8 +320,7 @@ def train_rl(cfg, init: str | None = None) -> None:
         playable_mask[0, playable] = True
         cq = cq.masked_fill(~playable_mask, float("-inf"))   # in hand AND affordable
         card_id = int(cq.argmax())
-        cmask = allcells_mask if card_id in anywhere_ids else yourhalf_mask   # DEPLOYABLE cells for this card
-        ceq = ceq.masked_fill(~cmask.unsqueeze(0), float("-inf"))
+        ceq = ceq.masked_fill(~anchor_mask[card_id].unsqueeze(0), float("-inf"))   # this card's anchors
         play_val = gq[0, 1] + cq[0].max() + ceq[0].max()
         wait_val = gq[0, 0]
         if wait_val >= play_val:
@@ -347,15 +367,11 @@ def train_rl(cfg, init: str | None = None) -> None:
             unplayable = (nhand < 0.5) | (afford_costs.unsqueeze(0) > nelx * 10.0 + 1e-6)
             cqn = cqn.masked_fill(unplayable, float("-inf"))            # in hand AND affordable
             sel_card = cqn.argmax(1, keepdim=True)                       # online greedy card
-            # cell mask per selected next-card: a your-half-only card can't bootstrap value from an
-            # enemy-half cell it could never place on (matches the deployable mask used in choose()).
-            if anywhere_ids_t.numel():
-                any_next = (sel_card == anywhere_ids_t.view(1, -1)).any(1, keepdim=True)
-            else:
-                any_next = torch.zeros_like(sel_card, dtype=torch.bool)
-            cellmask_next = torch.where(any_next, allcells_mask.unsqueeze(0), yourhalf_mask.unsqueeze(0))
+            # anchor mask per selected next-card: a card cannot bootstrap value from a head slot that
+            # is not one of ITS anchors (matches the mask used in choose()).
+            cellmask_next = anchor_mask[sel_card.squeeze(1)]
             ceqn = ceqn.masked_fill(~cellmask_next, float("-inf"))
-            sel_cell = ceqn.argmax(1, keepdim=True)                     # online greedy DEPLOYABLE cell
+            sel_cell = ceqn.argmax(1, keepdim=True)                     # online greedy anchor
             play_next = (gqn[:, 1] + cqn.max(1).values + ceqn.max(1).values) > gqn[:, 0]
             cq2, ceq2, gq2 = target(nobs, nhand, nnxt, nelx, nthr)
             cq2 = cq2.masked_fill(unplayable, float("-inf"))
@@ -376,7 +392,7 @@ def train_rl(cfg, init: str | None = None) -> None:
         torch.save({
             "model": net.policy.state_dict(),
             "gate": net.gate.state_dict(),
-            "grid": [gw, gh], "n_cards": n_cards, "n_cells": n_cells,
+            "action_space": _cur_sig, "n_cards": n_cards, "n_anchors": n_anchors,
             "threat_dim": threat_dim,
             "deck": deck,
             "obs_mode": obs_mode_cfg, "in_ch": obs_ch_cfg,   # observation layout (clashrl.semantic)

@@ -258,8 +258,7 @@ class SelfPlayOpponent:
         self.actions = env.actions
         self.db = env.db
         self.n_cards = env.n_cards
-        self.gw, self.gh = env.gw, env.gh
-        self.n_cells = env.n_cells
+        self.n_anchors = env.n_anchors
         self.obs_shape = env.obs_shape
         self.threat_dim = env.threat_dim
         self.use_detector = env.use_detector          # Stage 3: mirror the identity block for team 1
@@ -338,8 +337,7 @@ class SelfPlayOpponent:
         card = int(cq[0].argmax())
         cell = int(ceq[0].argmax())
 
-        cell = self.actions.deploy_clamp(card in self.anywhere_ids, cell)
-        lnx, lny = self.actions.cell_center(cell % self.gw, cell // self.gw)
+        lnx, lny = self.actions.point(card, cell)
         ex, ey = 1.0 - lnx, 1.0 - lny                            # mirror the local cell back to engine coords
         if eng.deploy(1, self.specs[card], ex, ey):
             idx = self.cycle.index(card)

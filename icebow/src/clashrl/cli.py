@@ -24,7 +24,7 @@ def _cmd_record(args) -> None:
 def _cmd_verify(args) -> None:
     from .verify import verify
     verify(Config.load(args.config), args.session, args.towers, args.hand, args.spells, args.threats,
-           args.clock, args.all)
+           args.clock, args.anchors, args.all)
 
 
 def _cmd_hand_templates(args) -> None:
@@ -32,20 +32,10 @@ def _cmd_hand_templates(args) -> None:
     build_hand_templates(Config.load(args.config), args.session, only_new=not args.include_known)
 
 
-# --- board-resolution presets: --size toggles action.grid without editing config.yaml -----------
-_GRID_SIZES = {"576": [18, 32], "432": [18, 24]}   # n_cells -> [cols, rows] (18-wide CR tile lattice)
-
-
 def _sized_config(args) -> "Config":
-    """Load the config, applying a --size override of action.grid when the flag is present
-    (576=[18,32] fine / 432=[18,24] coarse). Lets label / train-sim / play switch board resolution
-    without hand-editing config.yaml -- use the SAME size everywhere + a matching dataset/checkpoint."""
-    cfg = Config.load(args.config)
-    size = getattr(args, "size", None)
-    if size:
-        cfg.data.setdefault("action", {})["grid"] = list(_GRID_SIZES[size])
-        print(f"[cli] --size {size} -> action.grid {_GRID_SIZES[size]}")
-    return cfg
+    """Load the project config. (The old --size preset toggled `action.grid`; the grid was replaced by
+    per-card named anchors, so there is nothing to size -- see clashrl/actions.py.)"""
+    return Config.load(args.config)
 
 
 def _cmd_label(args) -> None:
@@ -221,6 +211,8 @@ def main() -> None:
                      help="overlay enemy-troop-mass detection to calibrate spell + patience rewards")
     ver.add_argument("--threats", action="store_true",
                      help="overlay the enemy-threat read (color/size/count/lane + projectiles) to calibrate reactive play")
+    ver.add_argument("--anchors", action="store_true",
+                     help="overlay every per-card PLACEMENT ANCHOR on a real frame to confirm each lands on its intended tile")
     ver.add_argument("--clock", action="store_true",
                      help="check the 2x/3x elixir badge (templates/elixir_2x.png,elixir_3x.png) match scores on in-match frames")
     ver.add_argument("--all", action="store_true",
@@ -231,9 +223,6 @@ def main() -> None:
     lab.add_argument("--session", default=None, help="session folder (default: latest)")
     lab.add_argument("--all", action="store_true", help="label every recorded session")
     lab.add_argument("--debug", action="store_true", help="save annotated frames of each extracted play")
-    lab.add_argument("--size", choices=["576", "432"], default=None,
-                     help="board resolution 576=[18,32] (fine) / 432=[18,24] (coarse); overrides action.grid so the "
-                          "rebuilt dataset is quantized at that resolution (match your sim/policy)")
     lab.set_defaults(func=_cmd_label)
 
     hnd = sub.add_parser("hand-templates",
@@ -269,9 +258,6 @@ def main() -> None:
     trl.add_argument("--init", default=None, metavar="CKPT",
                      help="checkpoint to warm-start from, e.g. data/policy_sim_best.pt to fine-tune the SIM policy "
                           "live. Default: data/policy_rl.pt if it exists, else data/policy.pt (the BC output).")
-    trl.add_argument("--size", choices=["576", "432"], default=None,
-                     help="board resolution 576=[18,32] / 432=[18,24]; overrides action.grid so the action masks "
-                          "match your --init checkpoint's grid (train-bc auto-follows the dataset, no --size there)")
     trl.set_defaults(func=_cmd_train_rl)
 
     tsi = sub.add_parser("train-sim",
@@ -281,9 +267,6 @@ def main() -> None:
     tsi.add_argument("--seed", type=int, default=0, help="RNG seed for the simulator")
     tsi.add_argument("--envs", type=int, default=None,
                      help="parallel (vectorized) match instances feeding one learner (default: sim.envs)")
-    tsi.add_argument("--size", choices=["576", "432"], default=None,
-                     help="board resolution 576=[18,32] / 432=[18,24]; overrides action.grid for this run "
-                          "(a from-scratch reset -- do NOT combine with --resume of the OTHER size)")
     tsi.set_defaults(func=_cmd_train_sim)
 
     dki = sub.add_parser("decks-import",
@@ -293,8 +276,6 @@ def main() -> None:
     dki.set_defaults(func=_cmd_decks_import)
 
     ply = sub.add_parser("play", help="run the trained policy live (needs torch + a trained policy)")
-    ply.add_argument("--size", choices=["576", "432"], default=None,
-                     help="board resolution 576=[18,32] / 432=[18,24]; overrides action.grid -- match your policy checkpoint")
     ply.set_defaults(func=_cmd_play)
 
     dia = sub.add_parser("diag", help="diagnose menu navigation: state-template match scores on the current screen")
@@ -364,7 +345,6 @@ def main() -> None:
     odv.add_argument("--mode", default=None, choices=["rgb", "semantic", "hybrid"],
                      help="score in this observation mode instead of config's (must match the checkpoint)")
     odv.add_argument("--conf", type=float, default=None, help="detector confidence (default: observation.detector_conf)")
-    odv.add_argument("--size", choices=sorted(_GRID_SIZES), default=None, help="board resolution preset")
     odv.set_defaults(func=_cmd_obs_diversity)
 
     abl = sub.add_parser("ablate-rewards",
@@ -379,7 +359,6 @@ def main() -> None:
     abl.add_argument("--resume", action="store_true", help="skip runs already present in the results JSON")
     abl.add_argument("--dry-run", dest="dry_run", action="store_true", help="print the plan and exit")
     abl.add_argument("--verbose", action="store_true", help="show each train-sim's own output")
-    abl.add_argument("--size", choices=sorted(_GRID_SIZES), default=None, help="board resolution preset")
     abl.set_defaults(func=_cmd_ablate_rewards)
 
     crl = sub.add_parser("card-roles",

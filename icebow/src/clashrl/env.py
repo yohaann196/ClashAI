@@ -22,12 +22,12 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from .actions import ActionSpace
+from .actions import AnchorSpace
 from .capture import WindowCapture
 from .controller import Controller
 from .outcome import outcome_reward, read_scoreboard
 from .reward import (TowerTracker, _anchors, enemy_mass, near_enemy_king, near_enemy_princess,
-                     threat_side, weaker_princess_cell, xbow_lock_cell)
+                     threat_side, weaker_princess_anchor)
 from .clock import ElixirClock
 from .states import GameState
 from .nav import MenuNavigator
@@ -48,14 +48,14 @@ class LiveMatchEnv:
         self.capture = WindowCapture(cfg.get("window", "title_contains", default=None),
                                      cfg.get("window", "region", default=None))
         self.vision = Vision(cfg)
-        self.actions = ActionSpace(cfg)
+        self.actions = AnchorSpace(cfg)
         self.controller = Controller(self.capture, cfg)
         self.tower = TowerTracker(cfg)
         self.tower_hp = TowerHpTracker(cfg)
         self.clock = ElixirClock(cfg, self.vision)   # 2x/3x elixir multiplier (feeds the phase machine)
         self.elixir_mult = 1
-        self.gw, self.gh = int(self.actions.gw), int(self.actions.gh)
-        self.n_slots, self.n_cells = self.actions.n_slots, self.actions.n_cells
+        # ACTION SPACE: per-card NAMED ANCHORS (clashrl/actions.py) -- exact tiles, no grid.
+        self.n_slots, self.n_anchors = self.actions.n_slots, self.actions.n_anchors
 
         self.act_period = float(cfg.get("play", "act_period", default=1.5))
         self.poll_dt = 1.0 / float(cfg.get("nav", "poll_hz", default=6))
@@ -379,27 +379,19 @@ class LiveMatchEnv:
         slot = next((s for s, c in enumerate(self.hand_ids) if c == card_id), -1)
         if slot < 0:                          # chosen card not in hand (unrecognized) -> skip
             return
-        gx, gy = cell % self.gw, cell // self.gw
-        self.controller.play_card(*self.actions.decode(slot, gx, gy))
+        self.controller.play_card(*self.actions.decode(slot, card_id, cell))
         self._cycle_tracker.record_play(card_id)      # a card left the hand -> it rotates to the queue back
         if card_id not in self.spell_ids:             # a TROOP you played -> tag its spawn as YOURS (team fix)
-            cx, cy = self.actions.cell_center(gx, gy)
+            cx, cy = self.actions.point(card_id, cell)
             self._team_tracker.record_play(cx, cy, time.time())
 
-    def _aim_weaker_tower(self, card_id: int, cell: int) -> int:
-        """A ROCKET or an offensive MINER aimed at an enemy princess is redirected to the lower-HP
-        princess so it finishes off the WEAKER tower (more efficient) instead of splitting damage --
-        the same chip logic for both. The policy can't read tower HP (it isn't in the observation), so
-        the env picks the weaker tower mechanically. No-op for other cards, other targets, or while a
-        princess is down / both are at equal HP (then the model's own aim / lane stands)."""
-        if card_id not in self.rocket_ids and card_id not in self.miner_ids:
-            return cell
-        gx, gy = cell % self.gw, cell // self.gw
-        cx, cy = self.actions.cell_center(gx, gy)
-        tgt = weaker_princess_cell(cx, cy, self.spell_aim_radius, self.tower.enemy_a,
-                                   self.tower_hp.enemy_hp, self.tower.enemy_alive,
-                                   self.actions)
-        return tgt if tgt is not None else cell
+    def _aim_weaker_tower(self, card_id: int, idx: int) -> int:
+        """A ROCKET aimed at an enemy princess is redirected to the LOWER-HP one so chip FINISHES a
+        tower instead of splitting across two. The policy can't read tower HP (it isn't in the
+        observation), so the env picks mechanically. With named anchors this is an exact swap between
+        the `enemy_left_tower` / `enemy_right_tower` anchors rather than the old cell search."""
+        return weaker_princess_anchor(self.actions, card_id, idx,
+                                      self.tower_hp.enemy_hp, self.tower.enemy_alive)
 
     # ============ CORRECTNESS-FIRST reward helpers (mirror the sim; from live perception) ============
     def _same_lane(self, cx: float) -> bool:
@@ -547,17 +539,10 @@ class LiveMatchEnv:
 
     def step(self, action: Action):
         play, card_id, cell = action
-        raw_cell = cell                           # the model's ATTEMPTED cell, before aim + deploy-clamp
-        if play:                                  # rocket / offensive miner -> aim the weaker enemy princess tower
+        if play:                                  # rocket aimed at a princess -> take the weaker one
+            # No deploy-clamp and no X-Bow lane-snapping any more: every anchor IS an exact, legal
+            # tile, which is precisely why the grid was replaced.
             cell = self._aim_weaker_tower(card_id, cell)
-            cell = self.actions.deploy_clamp(card_id in self.anywhere_ids, cell)  # rocket + miner go anywhere; rest = your half
-            if card_id in self.xbow_ids and not self._defensive:  # OFFENSIVE phase only: snap a forward X-Bow onto the nearer lane so it LOCKS
-                gx, gy = cell % self.gw, cell // self.gw
-                cx, cy = self.actions.cell_center(gx, gy)
-                _, enemy_a, _ = _anchors(self.cfg)
-                snapped = xbow_lock_cell(cx, cy, enemy_a, self.xbow_range, self.xbow_defense_front, self.actions)
-                if snapped is not None:
-                    cell = snapped
             action = (play, card_id, cell)
         eval_spell = bool(play) and card_id in self.spell_ids and self.spell_effect
         is_rocket = card_id in self.rocket_ids
@@ -568,8 +553,7 @@ class LiveMatchEnv:
             # Predict the impact time (rocket travel ~ distance; tornado ~immediate) and
             # sample a short window around it, so troops are caught in the radius whatever
             # the target distance is.
-            gx, gy = cell % self.gw, cell // self.gw
-            cx, cy = self.actions.cell_center(gx, gy)
+            cx, cy = self.actions.point(card_id, cell)
             it = self._impact_time(cx, cy, is_rocket, is_rd)
             prev = 0.0
             for off in (max(0.4, it - 0.7), it, it + 0.6):
@@ -628,8 +612,7 @@ class LiveMatchEnv:
                 self._defensive = True
                 print("[env] phase -> DEFENSIVE (X-Bow back-centre + rocket-cycle)")
             # --- CORRECTNESS score (mirrors the sim; from live perception) ---
-            gx, gy = cell % self.gw, cell // self.gw
-            cx, cy = self.actions.cell_center(gx, gy)
+            cx, cy = self.actions.point(card_id, cell)
             spent = float(self.card_elixir[card_id]) if (play and 0 <= card_id < self.n_cards) else 0.0
             if play and self._forced_expensive_spend(card_id, cy):
                 spent = 0.0            # forced defensive counter (no cheaper answer available) -> waive its spend

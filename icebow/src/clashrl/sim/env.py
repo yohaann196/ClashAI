@@ -15,7 +15,7 @@ from typing import Tuple
 
 import numpy as np
 
-from ..actions import ActionSpace
+from ..actions import AnchorSpace
 from ..cards import CardDB
 from .. import card_threat
 from .. import interactions
@@ -36,9 +36,10 @@ class SimMatchEnv:
         self.cfg = cfg
         self.rng = random.Random(seed)
         self.db = CardDB(cfg)
-        self.actions = ActionSpace(cfg)
-        self.gw, self.gh = int(self.actions.gw), int(self.actions.gh)
-        self.n_cells = int(self.actions.n_cells)
+        # ACTION SPACE: per-card NAMED ANCHORS (clashrl/actions.py) -- the 18x24 grid could not express
+        # the exact tiles this deck is decided by. `n_anchors` is the placement head's width.
+        self.actions = AnchorSpace(cfg, self.db)
+        self.n_anchors = int(self.actions.n_anchors)
         self.deck_keys = self.db.deck_identities()
         self.deck_card_levels = self.db.deck_levels()
         self.n_cards = max(1, len(self.deck_keys))
@@ -508,14 +509,14 @@ class SimMatchEnv:
         return credit
 
     def step(self, action: Action):
-        play, card_id, cell = action
+        play, card_id, anchor = action
         reward = 0.0
         spent = 0.0
         placed_id = -1
         if play and 0 <= card_id < self.n_cards and card_id in self._hand_ids():
             spec = self.specs[card_id]
-            cell = self.actions.deploy_clamp(card_id in self.anywhere_ids, cell)
-            nx, ny = self.actions.cell_center(cell % self.gw, cell // self.gw)
+            # every anchor is a legal, named position -- nothing to clamp and nothing to mask out
+            nx, ny = self.actions.point(card_id, anchor)
             if self.eng.deploy(0, spec, nx, ny):               # affordable + placed
                 spent = float(spec.elixir)
                 placed_id = card_id

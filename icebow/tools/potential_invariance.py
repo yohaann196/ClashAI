@@ -59,7 +59,7 @@ def _rollout(cfg, policy_seed: int, max_steps: int = 400):
         hand = [c for c in env._hand_ids() if env.specs[c].elixir <= env.eng.elixir[0]]
         # deliberately different behaviour per policy_seed: play rate and placement both vary
         if hand and rng.random() < (0.15 + 0.7 * ((policy_seed % 5) / 4.0)):
-            act = (1, rng.choice(hand), rng.randrange(env.n_cells))
+            act = (1, rng.choice(hand), rng.randrange(env.n_anchors))
         else:
             act = (0, 0, 0)
         _o, r, done, _i = env.step(act)

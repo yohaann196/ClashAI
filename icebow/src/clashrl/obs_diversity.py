@@ -62,12 +62,11 @@ def _stats(cells: List[int], n_cells: int) -> dict:
             "entropy": ent / denom if denom > 0 else 0.0, "top_cell": top_cell}
 
 
-def _fmt(label: str, s: dict, gw: int) -> str:
+def _fmt(label: str, s: dict, describe) -> str:
     if not s["n"]:
         return f"[obs-diversity] {label:<5}: no frames scored"
-    tc = s["top_cell"]
-    return (f"[obs-diversity] {label:<5}: {s['distinct']:4d} distinct cells over {s['n']:4d} frames"
-            f"   top_share {s['top_share']:.2f} (cell {tc} = col {tc % gw}, row {tc // gw})"
+    return (f"[obs-diversity] {label:<5}: {s['distinct']:4d} distinct placements over {s['n']:4d} frames"
+            f"   top_share {s['top_share']:.2f} ({describe(s['top_cell'])})"
             f"   entropy {s['entropy']:.2f}")
 
 
@@ -81,7 +80,7 @@ def obs_diversity(cfg, ckpt_path: Optional[str] = None, frames: int = 200, sessi
     import cv2
 
     from . import semantic
-    from .actions import ActionSpace
+    from .actions import AnchorSpace
     from .cards import CardDB
     from .model import PolicyNet
     from .train_rl import _pick_device
@@ -97,7 +96,7 @@ def obs_diversity(cfg, ckpt_path: Optional[str] = None, frames: int = 200, sessi
         print(f"[obs-diversity] no checkpoint at {path} -- train one first (run.py train-sim).")
         return
     ck = torch.load(path, map_location="cpu")
-    n_cards, n_cells = int(ck["n_cards"]), int(ck["n_cells"])
+    n_cards, n_anchors = int(ck["n_cards"]), int(ck["n_anchors"])
     threat_dim = int(ck.get("threat_dim", 14))
     ck_mode, ck_ch = ck.get("obs_mode", "rgb"), int(ck.get("in_ch", 3))
     if ck_mode != obs_mode or ck_ch != in_ch:
@@ -107,21 +106,14 @@ def obs_diversity(cfg, ckpt_path: Optional[str] = None, frames: int = 200, sessi
         return
 
     device = _pick_device(cfg)
-    net = PolicyNet(in_ch, n_cards, n_cells, threat_dim=threat_dim).to(device)
+    net = PolicyNet(in_ch, n_cards, n_anchors, threat_dim=threat_dim).to(device)
     net.load_state_dict(ck["model"])
     net.eval()
 
-    actions = ActionSpace(cfg)
-    gw = int(actions.gw)
     db = CardDB(cfg)
-    deck_keys = db.deck_identities()
-
-    def _base(k):
-        return k[:-4] if str(k).endswith("_evo") else str(k)
-
-    anywhere_ids = {i for i, k in enumerate(deck_keys) if _base(k) in ("rocket", "miner")}
-    yourhalf = torch.tensor(actions.deployable_mask(False), dtype=torch.bool, device=device)
-    allcells = torch.ones(n_cells, dtype=torch.bool, device=device)
+    actions = AnchorSpace(cfg, db)
+    deck_keys = list(db.deck_identities())
+    anchor_mask = torch.tensor(actions.mask_table(), dtype=torch.bool, device=device)
 
     def cell_argmax(obs, hand_vec, next_vec, elx, thr_vec) -> Optional[int]:
         """The cell the policy would actually place -- greedy, hand-masked, DEPLOYABLE-masked, exactly
@@ -138,8 +130,11 @@ def obs_diversity(cfg, ckpt_path: Optional[str] = None, frames: int = 200, sessi
         if not bool(torch.isfinite(cq).any()):
             return None
         ci = int(cq.argmax(1).item())
-        cmask = allcells if ci in anywhere_ids else yourhalf
-        return int(ceq.masked_fill(~cmask.unsqueeze(0), float("-inf")).argmax(1).item())
+        ai = int(ceq.masked_fill(~anchor_mask[ci].unsqueeze(0), float("-inf")).argmax(1).item())
+        # the action is the (card, anchor) PAIR: an anchor index alone is not comparable across cards
+        # (slot 1 is a different tile for X-Bow than for Rocket), and with only a handful of slots the
+        # slot-alone count would understate diversity badly.
+        return ci * n_anchors + ai
 
     # ---- SIM: a greedy rollout over the simulator -----------------------------------------------
     from .sim.env import SimMatchEnv
@@ -168,7 +163,8 @@ def obs_diversity(cfg, ckpt_path: Optional[str] = None, frames: int = 200, sessi
         # the policy's own narrow trajectory (which would understate diversity for a good policy)
         hand = [i for i, v in enumerate(sim_env.hand_vec) if v > 0.5]
         affordable = [i for i in hand if sim_env.specs[i].elixir <= sim_env.elixir]
-        act = ((1, random.choice(affordable), random.randrange(n_cells))
+        _c = random.choice(affordable) if affordable else 0
+        act = ((1, _c, random.randrange(max(1, actions.count(_c))))
                if affordable and random.random() < 0.5 else (0, 0, 0))
         obs, _r, done, _i = sim_env.step(act)
         if done:
@@ -249,18 +245,23 @@ def obs_diversity(cfg, ckpt_path: Optional[str] = None, frames: int = 200, sessi
             if c is not None:
                 real_cells.append(c)
 
-    s_sim = _stats(sim_cells, n_cells)
-    s_real = _stats(real_cells, n_cells)
+    def _describe(code: int) -> str:
+        c, a = divmod(int(code), n_anchors)
+        key = deck_keys[c] if c < len(deck_keys) else f"card{c}"
+        return f"{key}.{actions.name(c, a)}"
+
+    s_sim = _stats(sim_cells, n_anchors)
+    s_real = _stats(real_cells, n_anchors)
     print(f"[obs-diversity] checkpoint {path.name}  obs_mode={obs_mode} ({in_ch} ch)  "
-          f"grid {gw}x{int(actions.gh)} = {n_cells} cells")
-    print(_fmt("SIM", s_sim, gw))
+          f"action space: {n_cards} cards x up to {n_anchors} anchors")
+    print(_fmt("SIM", s_sim, _describe))
     if real_blocked is not None:
         print(f"[obs-diversity] REAL : NOT SCORED -- {real_blocked}")
         print("[obs-diversity] the sim-vs-real GAP is the whole metric, so this run is only half of it.")
     else:
-        print(_fmt("REAL", s_real, gw))
+        print(_fmt("REAL", s_real, _describe))
     if s_sim["n"] and s_real["n"]:
         ratio = s_real["distinct"] / max(1, s_sim["distinct"])
-        print(f"[obs-diversity] REAL/SIM distinct-cell ratio {ratio:.2f} "
+        print(f"[obs-diversity] REAL/SIM distinct-placement ratio {ratio:.2f} "
               f"(1.00 = the trunk responds to real frames as well as to sim frames; "
               f"5cdf867 measured 2/11 = 0.18 on the RGB observation)")

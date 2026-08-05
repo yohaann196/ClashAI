@@ -1299,6 +1299,71 @@ Newest entries are at the bottom.
 
 
 ------------------------------------------------------------------------------
+2026-08-05  —  ACTION SPACE: 18x24 placement GRID -> per-card NAMED ANCHORS at exact tiles
+------------------------------------------------------------------------------
+- WHY. The grid was 18x24 cells x 10 identities = ~4300 actions, and it could NOT express the tiles this
+  deck is decided by. An X-Bow's value is decided by WHICH TILE it sits on -- the 4-tile and 5-tile
+  placements reach the enemy tower, one row further back does not -- and the coarsened 24-row grid does
+  not even have a cell boundary in the right place. The policy was asked to find a handful of correct
+  tiles by exploring thousands of near-identical wrong ones. 87db21c made it worse ON PURPOSE: the
+  adaptive split-push opponents punish imprecise timing and placement specifically, and a space that
+  cannot represent the exact answer cannot learn to beat them.
+- NEW clashrl/actions.py :: AnchorSpace. Each card gets a small set of NAMED anchors defined in
+  config/cards.yaml under `anchors:` -- x_bow.4tile_left, tornado.king_activate, knight.bridge_right.
+  The action is (card identity, anchor index). 45 placements total, vs ~4300. Every one is a play a
+  person could describe out loud, and there are NO illegal placements: deploy_clamp, deployable_mask
+  and the X-Bow lane-snap all deleted with the grid.
+- ANCHORS ARE TILE OFFSETS FROM CALIBRATED LANDMARKS, not raw tile indices:
+      {name: 4tile_left, from: bridge_left, offset: [0, 4]}
+  Landmarks (tower centres, bridges, river) come straight from env.my_towers / env.enemy_towers -- the
+  same constants the sim engine seeds towers from and the live reward reads -- so a landmark is exactly
+  where every other component believes it is. Only the OFFSET is scaled by tile size. That matters:
+  action.arena_box is documented as a close APPROXIMATION of the tile grid, so hanging anchors off
+  landmarks confines that approximation to a few tiles of offset instead of letting it displace an
+  absolute tile index across the whole board. Offsets: +dcol right, +drow toward YOUR baseline.
+- MODEL. PolicyNet's placement head is now `n_anchors` wide (7 = the widest card's anchor count) instead
+  of 432, and is MASKED PER CARD exactly as the card head is masked to the hand. The old
+  your-half/anywhere deployable mask is gone -- a mask slot now means "this card does not use this
+  slot", not "this position is illegal". Applied in choose/greedy AND in the DDQN target.
+- CHECKPOINT MIGRATION GUARD (the 377b5b7 fail-fast pattern). Checkpoints carry an action-space
+  SIGNATURE (per-card anchor NAME lists + a hash); train-rl and play refuse a mismatch and print WHICH
+  card changed and the actionable path. A pre-anchor checkpoint has no signature and is named as such
+  ("predates named anchors -- trained on the 18x24 placement GRID"). Verified against a forged grid-era
+  checkpoint and a forged different-anchor checkpoint; both refused with the right message.
+  DELIBERATE: the signature keys off anchor NAMES/ORDER (what the head indexes), not coordinates, so
+  RE-CALIBRATING where an anchor sits -- the whole point of verify --anchors -- keeps a checkpoint
+  usable. Changing WHICH anchors exist does not.
+- NEW `run.py verify --anchors`. Overlays every anchor on a real in-match frame (one image per card +
+  a combined sheet), each as a crosshair with its name inside a ONE-TILE box, with the landmarks drawn
+  as red diamonds so you can see what each offset is relative to. Tile-exactness is the whole point, so
+  the shipped coordinates are a STARTING SET derived from the calibrated landmarks, not gospel -- an
+  anchor one tile off is worse than a grid cell because the policy will trust it.
+- IT IMMEDIATELY FOUND A REAL CONFLICT. verify --anchors also cross-checks anchors against the REWARD
+  geometry, and reported that at env.xbow_range 0.36 the canonical 4-tile (0.390) and 5-tile (0.414)
+  X-Bow anchors were BOTH scored as MISPLACES by _wincon_exec -- i.e. the reward would have trained the
+  policy against the two placements the anchors exist to express. Raised env.xbow_range 0.36 -> 0.42.
+  Anchors and the reward that scores them are configured separately, which is exactly why the
+  cross-check exists.
+- BEHAVIOUR CLONING. label.py now quantizes each recorded click onto the played card's own anchor list
+  (aspace.nearest) and stores an anchor index; datasets store the action-space signature. train-bc
+  detects an old GRID-labelled dataset (acts with 4 columns) and tells you to re-run `label --all`
+  rather than mis-training on it.
+- REMOVED with the grid: action.grid / deploy_top / king_avoid_half / princess_avoid_half, the --size
+  CLI presets (576/432), reward.xbow_lock_cell + weaker_princess_cell. action.arena_box SURVIVES and
+  now sets exactly one thing: the TILE SIZE offsets are measured in.
+  The Rocket "aim the weaker princess" redirect became an exact anchor SWAP (reward.weaker_princess_anchor)
+  instead of a cell search.
+- TESTS: tests/test_actions.py, 28 tests -- coverage (every deck card playable, the named placements
+  exist, evolutions inherit their base's anchors), resolved geometry (on-board, distinct, own-half for
+  non-spells, offsets really are N tiles), the head mask, click quantization, the migration guard
+  (including that a coordinate nudge does NOT invalidate a checkpoint but an anchor-list change does),
+  loud failure on misconfiguration, and the anchor/reward cross-check as a regression test. Suite:
+  194 passing.
+- RETRAIN REQUIRED: this is a new action space. Existing checkpoints and labelled datasets are both
+  invalid; train-sim from scratch, then train-rl --init. Run verify --anchors FIRST.
+
+
+------------------------------------------------------------------------------
 Notes / caveats
 ------------------------------------------------------------------------------
 - Reward-shaping changes only take effect after an RL run (`train-rl`) — they

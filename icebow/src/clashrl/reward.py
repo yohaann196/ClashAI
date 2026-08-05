@@ -367,3 +367,29 @@ class TowerTracker:
         ek = len(self.enemy_alive) >= 3 and (not self.enemy_alive[2] or self._enemy_low[2] >= 1)
         mk = len(self.mine_alive) >= 3 and (not self.mine_alive[2] or self._mine_low[2] >= 1)
         return ek, mk
+
+
+def weaker_princess_anchor(aspace, card_id: int, idx: int, enemy_hp, enemy_alive) -> int:
+    """Redirect a tower-aimed anchor to the WEAKER enemy princess.
+
+    With named anchors this replaces the old `weaker_princess_cell` geometry search: a Rocket aimed at
+    `enemy_left_tower` or `enemy_right_tower` is simply swapped to the other one when that tower is
+    alive and lower on HP, so chip finishes a tower instead of splitting across two. The policy cannot
+    read tower HP (it is not in the observation), so the env picks mechanically -- unchanged in intent,
+    now exact rather than approximated by a cell search. Returns the anchor index to actually use.
+    """
+    a = aspace.anchor(card_id, idx)
+    if a is None or a.name not in ("enemy_left_tower", "enemy_right_tower"):
+        return idx
+    here, other = (0, 1) if a.name == "enemy_left_tower" else (1, 0)
+    hp = list(enemy_hp or [])
+    alive = list(enemy_alive or [])
+    if len(hp) < 2 or len(alive) < 2 or not alive[other]:
+        return idx
+    if not alive[here]:                              # aimed at a dead tower -> take the live one
+        swapped = aspace.index_of(card_id, "enemy_right_tower" if other == 1 else "enemy_left_tower")
+        return swapped if swapped >= 0 else idx
+    if hp[other] < hp[here]:
+        swapped = aspace.index_of(card_id, "enemy_right_tower" if other == 1 else "enemy_left_tower")
+        return swapped if swapped >= 0 else idx
+    return idx
